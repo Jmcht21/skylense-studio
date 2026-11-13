@@ -49,6 +49,103 @@
     --transition-smooth: all 0.22s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
+/* Direction artistique: cartographie éditoriale, nette et sans effet logiciel. */
+:root {
+    --bg-app: #0b0b0a;
+    --bg-panel: rgba(15, 15, 14, 0.96);
+    --bg-panel-solid: #11110f;
+    --bg-card: #181815;
+    --bg-card-hover: #23231e;
+    --bg-input: #141412;
+    --bg-input-focus: #1d1d18;
+    --text-primary: #f2efe7;
+    --text-secondary: #aaa69b;
+    --text-muted: #77736a;
+    --text-accent: #d6a84f;
+    --border-subtle: rgba(242, 239, 231, 0.12);
+    --border-medium: rgba(242, 239, 231, 0.2);
+    --border-accent: rgba(214, 168, 79, 0.7);
+    --brand-primary: #d6a84f;
+    --radius-xs: 2px;
+    --radius-sm: 3px;
+    --radius-md: 4px;
+    --radius-lg: 5px;
+    --radius-xl: 6px;
+}
+
+html, body {
+    font-family: 'Space Grotesk', 'Inter', sans-serif;
+}
+
+#sidebar, .studio-sidebar, .studio-header {
+    border-radius: 0;
+}
+
+#sidebar {
+    border-left: 2px solid var(--text-accent);
+}
+
+.brand-text h1, .studio-logo-name {
+    font-family: 'Syne', sans-serif;
+    letter-spacing: -0.035em;
+}
+
+.mode-nav-tabs {
+    border-radius: 2px;
+    gap: 2px;
+}
+
+.mode-tab-btn {
+    min-width: 0;
+    padding: 8px 4px;
+    border-radius: 2px;
+    font-size: 10px;
+    letter-spacing: -0.01em;
+}
+
+.mode-tab-btn.active {
+    background: var(--text-accent);
+    color: #14120d;
+    box-shadow: none;
+}
+
+.input-text, .select-control, .format-btn, .custom-format-box {
+    border-radius: 2px;
+}
+
+.section-title, .studio-group-title {
+    letter-spacing: 0.11em;
+}
+
+.form-label-tag, .studio-group-tag {
+    color: var(--text-accent);
+}
+
+.map-nav-btn.active {
+    background: var(--text-accent);
+    color: #14120d;
+    border-color: var(--text-accent);
+}
+
+.btn-compile-primary, .btn-final-export, .btn-header-export {
+    border-radius: 2px;
+    background: var(--text-accent);
+    color: #14120d;
+}
+
+.palette-chip, .res-card, .text-mode-btn {
+    border-radius: 2px;
+}
+
+.chip-swatch {
+    border-radius: 1px;
+}
+
+.chip-swatch-transparent {
+    background: #808080;
+    border: 1px solid rgba(255, 255, 255, 0.35);
+}
+
 /* Thème Clair Épuré (Graphite / Blanc Pur / Zinc) */
 [data-ui-theme="light"] {
     --bg-app: #f4f4f5;
@@ -339,11 +436,16 @@ html, body {
     box-shadow: var(--shadow-md);
     transition: left 0.3s cubic-bezier(0.16, 1, 0.3, 1), background 0.15s ease;
 }
+#sidebar-toggle-btn.is-collapsed {
+    left: 20px;
+}
 #sidebar-toggle-btn:hover {
     background: var(--bg-card);
 }
-#sidebar.collapsed + #sidebar-toggle-btn {
-    left: 20px;
+
+.fullscreen-overlay {
+    left: 0;
+    width: 100vw;
 }
 
 /* En-tête de Sidebar */
@@ -364,17 +466,6 @@ html, body {
     display: flex;
     align-items: center;
     gap: 10px;
-}
-.brand-icon {
-    width: 32px;
-    height: 32px;
-    border-radius: var(--radius-sm);
-    background: var(--bg-card);
-    border: 1px solid var(--border-medium);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--text-accent);
 }
 .brand-text h1 {
     font-size: 15px;
@@ -842,6 +933,42 @@ html, body {
 }
 .btn-header-export:hover {
     background: var(--btn-primary-hover);
+}
+.btn-header-export:disabled,
+.btn-final-export:disabled,
+.btn-final-export-secondary:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+.studio-toponymy-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    max-width: 260px;
+    color: var(--text-muted);
+    font-size: 10px;
+    line-height: 1.25;
+    text-align: right;
+}
+.studio-toponymy-status.ready {
+    color: var(--text-accent);
+}
+.studio-toponymy-status.error {
+    color: #d98b7d;
+}
+.status-dot {
+    width: 7px;
+    height: 7px;
+    flex: 0 0 7px;
+    border-radius: 50%;
+    background: currentColor;
+}
+.studio-toponymy-status.loading .status-dot {
+    animation: studio-status-pulse 1.2s ease-in-out infinite;
+}
+@keyframes studio-status-pulse {
+    50% { opacity: 0.3; }
 }
 .btn-header-export.btn-outline {
     background: var(--bg-card);

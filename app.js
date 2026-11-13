@@ -195,6 +195,76 @@ const PRESET_PLACES = {
         subtitle: '41.796° N, 9.224° E — CORSE-DU-SUD',
         coords: [41.796, 9.224],
         zoom: 13
+    },
+    paris: {
+        name: 'Paris',
+        title: 'PARIS',
+        subtitle: '48.856° N, 2.352° E — ÎLE-DE-FRANCE',
+        coords: [48.8566, 2.3522],
+        zoom: 13
+    },
+    lyon: {
+        name: 'Lyon',
+        title: 'LYON',
+        subtitle: '45.764° N, 4.835° E — RHÔNE & SAÔNE',
+        coords: [45.764, 4.8357],
+        zoom: 13
+    },
+    bordeaux: {
+        name: 'Bordeaux',
+        title: 'BORDEAUX',
+        subtitle: '44.837° N, -0.579° O — PORT DE LA LUNE',
+        coords: [44.8378, -0.5792],
+        zoom: 13
+    },
+    marseille: {
+        name: 'Marseille',
+        title: 'MARSEILLE',
+        subtitle: '43.296° N, 5.369° E — VIEUX-PORT',
+        coords: [43.2965, 5.3698],
+        zoom: 13
+    },
+    toulouse: {
+        name: 'Toulouse',
+        title: 'TOULOUSE',
+        subtitle: '43.604° N, 1.444° E — VILLE ROSE',
+        coords: [43.6047, 1.4442],
+        zoom: 13
+    },
+    strasbourg: {
+        name: 'Strasbourg',
+        title: 'STRASBOURG',
+        subtitle: '48.573° N, 7.752° E — GRANDE ÎLE & ILL',
+        coords: [48.5734, 7.7521],
+        zoom: 13
+    },
+    geneve: {
+        name: 'Genève',
+        title: 'GENÈVE',
+        subtitle: '46.204° N, 6.143° E — LAC LÉMAN',
+        coords: [46.2044, 6.1432],
+        zoom: 13
+    },
+    newyork: {
+        name: 'New York',
+        title: 'NEW YORK',
+        subtitle: '40.712° N, 74.006° O — MANHATTAN',
+        coords: [40.7128, -74.006],
+        zoom: 12
+    },
+    londres: {
+        name: 'Londres',
+        title: 'LONDON',
+        subtitle: '51.507° N, 0.127° O — RIVER THAMES',
+        coords: [51.5074, -0.1278],
+        zoom: 13
+    },
+    philadelphia: {
+        name: 'Philadelphie',
+        title: 'PHILADELPHIA',
+        subtitle: '39.952° N, 75.165° O — PENNSYLVANIA',
+        coords: [39.9526, -75.1652],
+        zoom: 13
     }
 };
 
@@ -232,45 +302,646 @@ function haversineDistanceMeters(lat1, lon1, lat2, lon2) {
     return R * c;
 }
 
-// 0. REQUETE OVERPASS AVEC MIROIRS ROBUSTES & PROXY CORS DE SECOURS (Requete GET simple, sans preflight OPTIONS)
-async function queryOverpassMirror(query, timeoutMs = 4000) {
+// ==============================================================================
+// 0. DÉCODEUR PROTOCOL BUFFERS & MAPBOX VECTOR TILES (MVT) EN PUR JAVASCRIPT
+// Moteur haute performance OpenMapTiles & OpenFreeMap (100% Client-side, sans clé API)
+// ==============================================================================
+
+// Point 2D pour les géométries vectorielles
+function Point(x, y) {
+    this.x = x;
+    this.y = y;
+}
+Point.prototype.clone = function() {
+    return new Point(this.x, this.y);
+};
+
+// Entité vectorielle MVT (Feature)
+function VectorTileFeature(pbf, end, extent, keys, values) {
+    this.properties = {};
+    this.extent = extent;
+    this.type = 0;
+    this._pbf = pbf;
+    this._geometry = -1;
+    this._keys = keys;
+    this._values = values;
+    pbf.readFields(readFeature, this, end);
+}
+function readFeature(tag, feature, pbf) {
+    if (tag === 1) feature.id = pbf.readVarint();
+    else if (tag === 2) readTag(pbf, feature);
+    else if (tag === 3) feature.type = pbf.readVarint();
+    else if (tag === 4) feature._geometry = pbf.pos;
+}
+function readTag(pbf, feature) {
+    var end = pbf.readVarint() + pbf.pos;
+    while (pbf.pos < end) {
+        var key = feature._keys[pbf.readVarint()];
+        var value = feature._values[pbf.readVarint()];
+        feature.properties[key] = value;
+    }
+}
+VectorTileFeature.types = ['Unknown', 'Point', 'LineString', 'Polygon'];
+
+VectorTileFeature.prototype.loadGeometry = function() {
+    var pbf = this._pbf;
+    pbf.pos = this._geometry;
+    var end = pbf.readVarint() + pbf.pos,
+        cmd = 1, length = 0, x = 0, y = 0, lines = [], line;
+
+    while (pbf.pos < end) {
+        if (length <= 0) {
+            var cmdLen = pbf.readVarint();
+            cmd = cmdLen & 0x7;
+            length = cmdLen >> 3;
+        }
+        length--;
+        if (cmd === 1 || cmd === 2) {
+            x += pbf.readSVarint();
+            y += pbf.readSVarint();
+            if (cmd === 1) {
+                if (line) lines.push(line);
+                line = [];
+            }
+            line.push(new Point(x, y));
+        } else if (cmd === 7) {
+            if (line && line.length > 0) line.push(line[0].clone());
+        } else {
+            throw new Error('Commande MVT inconnue : ' + cmd);
+        }
+    }
+    if (line) lines.push(line);
+    return lines;
+};
+
+// Calque vectoriel MVT (Layer)
+function VectorTileLayer(pbf, end) {
+    this.version = 1;
+    this.name = null;
+    this.extent = 4096;
+    this.length = 0;
+    this._pbf = pbf;
+    this._keys = [];
+    this._values = [];
+    this._features = [];
+    pbf.readFields(readLayer, this, end);
+    this.length = this._features.length;
+}
+function readLayer(tag, layer, pbf) {
+    if (tag === 15) layer.version = pbf.readVarint();
+    else if (tag === 1) layer.name = pbf.readString();
+    else if (tag === 5) layer.extent = pbf.readVarint();
+    else if (tag === 2) layer._features.push(pbf.pos);
+    else if (tag === 3) layer._keys.push(pbf.readString());
+    else if (tag === 4) layer._values.push(readValueMessage(pbf));
+}
+function readValueMessage(pbf) {
+    var value = null, end = pbf.readVarint() + pbf.pos;
+    while (pbf.pos < end) {
+        var tag = pbf.readVarint() >> 3;
+        value = tag === 1 ? pbf.readString() :
+            tag === 2 ? pbf.readFloat() :
+            tag === 3 ? pbf.readDouble() :
+            tag === 4 ? pbf.readVarint64() :
+            tag === 5 ? pbf.readVarint() :
+            tag === 6 ? pbf.readSVarint() :
+            tag === 7 ? pbf.readBoolean() : null;
+    }
+    return value;
+}
+VectorTileLayer.prototype.feature = function(i) {
+    if (i < 0 || i >= this._features.length) throw new Error('Index de feature hors limites');
+    this._pbf.pos = this._features[i];
+    var end = this._pbf.readVarint() + this._pbf.pos;
+    return new VectorTileFeature(this._pbf, end, this.extent, this._keys, this._values);
+};
+
+// Tuile vectorielle complète MVT (VectorTile)
+function VectorTile(pbf, end) {
+    this.layers = pbf.readFields(readTile, {}, end);
+}
+function readTile(tag, layers, pbf) {
+    if (tag === 3) {
+        var layer = new VectorTileLayer(pbf, pbf.readVarint() + pbf.pos);
+        if (layer.length) layers[layer.name] = layer;
+    }
+}
+
+// Vérification de la disponibilité de la bibliothèque Pbf
+async function ensurePbfLoaded() {
+    if (typeof Pbf !== 'undefined') return;
+    if (typeof window !== 'undefined' && window.Pbf) return;
+    return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/pbf@3.2.1/dist/pbf.js';
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error("Impossible de charger la bibliothèque Pbf"));
+        document.head.appendChild(s);
+    });
+}
+
+// Récupération dynamique du template d'URL OpenFreeMap à jour
+let openFreeMapTileTemplate = 'https://tiles.openfreemap.org/planet/{z}/{x}/{y}.pbf';
+let openFreeMapInitPromise = null;
+
+async function getOpenFreeMapTileTemplate() {
+    if (openFreeMapTileTemplate && openFreeMapTileTemplate.includes('/planet/20')) {
+        return openFreeMapTileTemplate;
+    }
+    if (!openFreeMapInitPromise) {
+        openFreeMapInitPromise = (async () => {
+            try {
+                const ctrl = new AbortController();
+                const to = setTimeout(() => ctrl.abort(), 2000);
+                const res = await fetch('https://tiles.openfreemap.org/planet', { signal: ctrl.signal });
+                clearTimeout(to);
+                if (res.ok) {
+                    const tj = await res.json();
+                    if (tj.tiles && tj.tiles[0]) {
+                        openFreeMapTileTemplate = tj.tiles[0];
+                    }
+                }
+            } catch (e) {
+                // Utiliser le template par défaut en cas d'indisponibilité du TileJSON
+            }
+            return openFreeMapTileTemplate;
+        })();
+    }
+    return openFreeMapInitPromise;
+}
+
+/**
+ * 0.bis MOTEUR D'EXTRACTION VECTORIELLE PURE OPENFREEMAP (MVT / PBF)
+ * Télécharge et décode les vraies géométries vectorielles brutes en < 300 ms, 100% gratuit, sans clé API
+ */
+async function fetchUrbanVectorTiles(bbox, density = 'standard', options = {}) {
+    await ensurePbfLoaded();
+    const PbfClass = (typeof Pbf !== 'undefined' ? Pbf : (typeof window !== 'undefined' ? window.Pbf : null));
+    if (!PbfClass) throw new Error("Pbf non disponible");
+
+    const tileUrlTemplate = await getOpenFreeMapTileTemplate();
+
+    function mercatorY(lat) {
+        const rad = Math.max(-85.0511, Math.min(85.0511, lat)) * Math.PI / 180;
+        return Math.log(Math.tan(Math.PI / 4 + rad / 2));
+    }
+
+    const northNormY = (1 - mercatorY(bbox.north) / Math.PI) / 2;
+    const southNormY = (1 - mercatorY(bbox.south) / Math.PI) / 2;
+    const westNormX = (bbox.west + 180) / 360;
+    const eastNormX = (bbox.east + 180) / 360;
+
+    const deltaNormX = eastNormX - westNormX;
+    const deltaNormY = southNormY - northNormY;
+
+    const dLon = bbox.east - bbox.west;
+    const dLat = bbox.north - bbox.south;
+    const maxSpan = Math.max(dLon, dLat);
+
+    // Sélection intelligente du niveau de zoom vectoriel pour avoir tous les détails
+    // tout en conservant un nombre de tuiles optimal (4 à 20 tuiles maximum)
+    let z = 13;
+    if (maxSpan < 0.08) z = (density === 'minimal') ? 13 : 14;
+    else if (maxSpan < 0.22) z = (density === 'all') ? 14 : 13;
+    else if (maxSpan < 0.45) z = 12;
+    else if (maxSpan < 1.0) z = 11;
+    else z = 10;
+    z = Math.min(14, z);
+
+    const numTiles = Math.pow(2, z);
+    const minTx = Math.max(0, Math.floor(westNormX * numTiles));
+    const maxTx = Math.min(numTiles - 1, Math.floor(eastNormX * numTiles));
+    const minTy = Math.max(0, Math.floor(northNormY * numTiles));
+    const maxTy = Math.min(numTiles - 1, Math.floor(southNormY * numTiles));
+
+    const tileRequests = [];
+    for (let tx = minTx; tx <= maxTx; tx++) {
+        for (let ty = minTy; ty <= maxTy; ty++) {
+            tileRequests.push({ z, tx, ty });
+        }
+    }
+
+    // Téléchargement concurrent de toutes les tuiles vectorielles via Cloudflare Edge (< 200 ms)
+    const tileBuffers = await Promise.all(
+        tileRequests.map(async (t) => {
+            const u = tileUrlTemplate.replace('{z}', t.z).replace('{x}', t.tx).replace('{y}', t.ty);
+            try {
+                const ctrl = new AbortController();
+                const timer = setTimeout(() => ctrl.abort(), 6000);
+                const res = await fetch(u, { signal: ctrl.signal });
+                clearTimeout(timer);
+                if (!res.ok) return { ...t, buffer: null };
+                const buf = await res.arrayBuffer();
+                return { ...t, buffer: buf };
+            } catch (err) {
+                return { ...t, buffer: null };
+            }
+        })
+    );
+
+    const validTiles = tileBuffers.filter(t => t.buffer && t.buffer.byteLength > 0);
+    if (validTiles.length === 0) {
+        throw new Error("Aucune tuile vectorielle reçue depuis le serveur.");
+    }
+
+    const waterways = [];
+    const waterBodies = [];
+    const motorways = [];
+    const roadsMajor = [];
+    const roadsMinor = [];
+    const cities = [];
+
+    for (const t of validTiles) {
+        let tile;
+        try {
+            const pbf = new PbfClass(new Uint8Array(t.buffer));
+            tile = new VectorTile(pbf);
+        } catch (e) {
+            continue;
+        }
+
+        const tx = t.tx;
+        const ty = t.ty;
+
+        function toPosterPoint(p, extent) {
+            const gx = (tx + p.x / extent) / numTiles;
+            const gy = (ty + p.y / extent) / numTiles;
+            return {
+                x: (gx - westNormX) / deltaNormX,
+                y: (gy - northNormY) / deltaNormY
+            };
+        }
+
+        function isPointInOrNearBBox(pt) {
+            return pt.x >= -0.05 && pt.x <= 1.05 && pt.y >= -0.05 && pt.y <= 1.05;
+        }
+
+        function filterLinePoints(rawLine, extent) {
+            const pts = [];
+            for (let i = 0; i < rawLine.length; i++) {
+                pts.push(toPosterPoint(rawLine[i], extent));
+            }
+            return pts;
+        }
+
+        // 1. Calque Transportation : Réseau routier hiérarchisé
+        const transLayer = tile.layers.transportation;
+        if (transLayer) {
+            const len = transLayer.length;
+            for (let i = 0; i < len; i++) {
+                const f = transLayer.feature(i);
+                const props = f.properties || {};
+                const cls = props.class || 'minor';
+
+                const isMotorway = (cls === 'motorway' || cls === 'motorway_link' || cls === 'trunk' || cls === 'trunk_link');
+                const isMajor = (cls === 'primary' || cls === 'primary_link' || cls === 'secondary' || cls === 'secondary_link' || cls === 'tertiary' || cls === 'tertiary_link');
+                const isMinor = (!isMotorway && !isMajor && cls !== 'rail' && cls !== 'ferry');
+
+                if (isMotorway && options.includeMotorways === false) continue;
+                if (isMajor && options.includePrimary === false) continue;
+                if (isMinor && options.includeResidential === false) continue;
+
+                if (density === 'minimal' && !isMotorway && cls !== 'primary') continue;
+                if (density === 'major' && isMinor) continue;
+
+                const lines = f.loadGeometry();
+                for (const line of lines) {
+                    if (line.length < 2) continue;
+                    const pts = filterLinePoints(line, f.extent);
+                    if (!pts.some(isPointInOrNearBBox)) continue;
+
+                    const item = {
+                        id: f.id || Math.random(),
+                        name: props.name || '',
+                        hw: cls,
+                        points: pts
+                    };
+
+                    if (isMotorway) motorways.push(item);
+                    else if (isMajor) roadsMajor.push(item);
+                    else roadsMinor.push(item);
+                }
+            }
+        }
+
+        // 2. Calque Water : Surfaces en eau (Mers, Lacs, Fleuves larges, Bassins)
+        const waterLayer = tile.layers.water;
+        if (waterLayer && options.includeWaterbodies !== false) {
+            const len = waterLayer.length;
+            for (let i = 0; i < len; i++) {
+                const f = waterLayer.feature(i);
+                const rings = f.loadGeometry();
+                for (const ring of rings) {
+                    if (ring.length < 3) continue;
+                    const pts = filterLinePoints(ring, f.extent);
+                    if (!pts.some(isPointInOrNearBBox)) continue;
+
+                    waterBodies.push({
+                        id: f.id || Math.random(),
+                        name: f.properties.name || '',
+                        points: pts
+                    });
+                }
+            }
+        }
+
+        // 3. Calque Waterway : Cours d'eau linéaires (Fleuves, Rivières, Canaux)
+        const waterwayLayer = tile.layers.waterway;
+        if (waterwayLayer && options.includeWaterways !== false) {
+            const len = waterwayLayer.length;
+            for (let i = 0; i < len; i++) {
+                const f = waterwayLayer.feature(i);
+                const cls = f.properties.class || 'river';
+                if (cls === 'stream' && density !== 'all') continue;
+
+                const lines = f.loadGeometry();
+                for (const line of lines) {
+                    if (line.length < 2) continue;
+                    const pts = filterLinePoints(line, f.extent);
+                    if (!pts.some(isPointInOrNearBBox)) continue;
+
+                    waterways.push({
+                        id: f.id || Math.random(),
+                        name: f.properties.name || '',
+                        type: cls,
+                        points: pts
+                    });
+                }
+            }
+        }
+
+        // 4. Calque Place : Communes, Villes et Quartiers extraits directement des tuiles
+        const placeLayer = tile.layers.place;
+        if (placeLayer) {
+            const len = placeLayer.length;
+            for (let i = 0; i < len; i++) {
+                const f = placeLayer.feature(i);
+                const props = f.properties || {};
+                const name = props.name || props['name:fr'] || props['name:en'];
+                if (!name) continue;
+
+                const cls = props.class || 'village';
+                if (cls === 'country' || cls === 'state' || cls === 'province') continue;
+
+                const pts = f.loadGeometry();
+                if (pts && pts[0] && pts[0][0]) {
+                    const normPt = toPosterPoint(pts[0][0], f.extent);
+                    if (normPt.x >= 0 && normPt.x <= 1 && normPt.y >= 0 && normPt.y <= 1) {
+                        const ptGx = normPt.x * deltaNormX + westNormX;
+                        const ptGy = normPt.y * deltaNormY + northNormY;
+                        const lon = ptGx * 360 - 180;
+                        const latRad = Math.PI * (1 - 2 * ptGy);
+                        const lat = 180 / Math.PI * (2 * Math.atan(Math.exp(latRad)) - Math.PI / 2);
+
+                        cities.push({
+                            name: name,
+                            lat: lat,
+                            lon: lon,
+                            type: cls,
+                            rank: props.rank || 10,
+                            population: props.population || 0,
+                            gridX: normPt.x * 1000,
+                            gridY: normPt.y * 1000
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    const totalFeatures = motorways.length + roadsMajor.length + roadsMinor.length + waterways.length + waterBodies.length;
+
+    return {
+        waterways,
+        waterBodies,
+        motorways,
+        roadsMajor,
+        roadsMinor,
+        cities,
+        totalFeatures
+    };
+}
+
+// 0.ter REQUETE OVERPASS DE SECOURS (Multi-miroirs avec Content-Type et repli GET)
+async function queryOverpassMirror(query, timeoutMs = 8000) {
     const mirrors = [
+        'https://overpass.openstreetmap.fr/api/interpreter',
         'https://overpass-api.de/api/interpreter',
         'https://lz4.overpass-api.de/api/interpreter',
         'https://z.overpass-api.de/api/interpreter',
-        'https://overpass.kumi.systems/api/interpreter'
+        'https://overpass.kumi.systems/api/interpreter',
+        'https://overpass.private.coffee/api/interpreter'
     ];
+
+    const encodedData = 'data=' + encodeURIComponent(query);
+
     for (const url of mirrors) {
         try {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), timeoutMs);
-            const getUrl = `${url}?data=${encodeURIComponent(query)}`;
-            const res = await fetch(getUrl, { signal: controller.signal });
+
+            let res = null;
+            try {
+                res = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+                    },
+                    body: encodedData,
+                    signal: controller.signal
+                });
+            } catch (errPost) {}
+
+            clearTimeout(timer);
+
+            if (res && res.ok) {
+                const data = await res.json().catch(() => null);
+                if (data && Array.isArray(data.elements) && data.elements.length > 0) {
+                    return data.elements;
+                }
+            }
+
+            if (!res || !res.ok) {
+                const getController = new AbortController();
+                const getTimer = setTimeout(() => getController.abort(), Math.min(timeoutMs, 4000));
+                const getUrl = `${url}?data=${encodeURIComponent(query)}`;
+                const getRes = await fetch(getUrl, { signal: getController.signal }).catch(() => null);
+                clearTimeout(getTimer);
+                if (getRes && getRes.ok) {
+                    const data = await getRes.json().catch(() => null);
+                    if (data && Array.isArray(data.elements) && data.elements.length > 0) {
+                        return data.elements;
+                    }
+                }
+            }
+        } catch (e) {}
+    }
+
+    const backupProxies = [
+        `https://api.allorigins.win/raw?url=${encodeURIComponent('https://overpass.openstreetmap.fr/api/interpreter?data=' + encodeURIComponent(query))}`,
+        `https://api.allorigins.win/raw?url=${encodeURIComponent('https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(query))}`
+    ];
+
+    for (const proxyUrl of backupProxies) {
+        try {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs + 2000);
+            const res = await fetch(proxyUrl, { signal: controller.signal });
             clearTimeout(timer);
             if (res.ok) {
-                const data = await res.json();
-                if (data && data.elements && data.elements.length > 0) return data.elements;
+                const data = await res.json().catch(() => null);
+                if (data && Array.isArray(data.elements) && data.elements.length > 0) {
+                    return data.elements;
+                }
             }
-        } catch (e) {
-            // Continuer vers le miroir suivant sans bloquer
+        } catch (e) {}
+    }
+
+    return null;
+}
+
+/**
+ * 0.quater EXTRACTION UNIFIÉE DES ROUTES & FLEUVES (MODE PLAN URBAIN D'ART)
+ * Stratégie : OpenFreeMap MVT en priorité (< 300 ms), avec bascule Overpass automatique en secours
+ */
+async function fetchUrbanRoadsAndWaterways(bbox, density = 'standard', options = {}) {
+    // 1. Tenter l'extraction vectorielle MVT OpenFreeMap (instantané < 300 ms)
+    try {
+        const mvtResult = await fetchUrbanVectorTiles(bbox, density, options);
+        if (mvtResult && mvtResult.totalFeatures > 0) {
+            return mvtResult;
+        }
+    } catch (mvtErr) {
+        console.warn("[MVT OpenFreeMap] Indisponible, activation du repli Overpass :", mvtErr.message);
+    }
+
+    // 2. Repli de sécurité : Requête Overpass API adaptée
+    const s = bbox.south.toFixed(5);
+    const w = bbox.west.toFixed(5);
+    const n = bbox.north.toFixed(5);
+    const e = bbox.east.toFixed(5);
+
+    const dLat = bbox.north - bbox.south;
+    let effectiveDensity = density;
+    if (dLat > 0.35 && effectiveDensity === 'all') effectiveDensity = 'standard';
+    if (dLat > 0.55 && effectiveDensity === 'standard') effectiveDensity = 'major';
+
+    function buildQuery(densityLevel, includeStreams = false) {
+        let waterParts = '';
+        if (options.includeWaterways !== false) {
+            const wFilter = includeStreams ? 'river|canal|stream' : 'river|canal';
+            waterParts += `way["waterway"~"${wFilter}"](${s},${w},${n},${e});`;
+        }
+        if (options.includeWaterbodies !== false) {
+            waterParts += `way["natural"="water"](${s},${w},${n},${e});way["water"](${s},${w},${n},${e});way["waterway"="riverbank"](${s},${w},${n},${e});way["landuse"~"basin|reservoir"](${s},${w},${n},${e});`;
+        }
+
+        let roadFilter = 'motorway|motorway_link|trunk|trunk_link';
+        if (densityLevel === 'major') {
+            roadFilter = 'motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link';
+        } else if (densityLevel === 'standard') {
+            roadFilter = 'motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link';
+        } else if (densityLevel === 'all') {
+            roadFilter = 'motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|residential|living_street|pedestrian|unclassified';
+        }
+
+        let roadParts = '';
+        if (options.includeMotorways !== false || options.includePrimary !== false || options.includeResidential !== false) {
+            roadParts += `way["highway"~"${roadFilter}"](${s},${w},${n},${e});`;
+        }
+
+        return `[out:json][timeout:25][maxsize:25000000];(${waterParts}${roadParts});out geom qt;`;
+    }
+
+    const mainQuery = buildQuery(effectiveDensity, dLat <= 0.15 && effectiveDensity === 'all');
+    let elements = await queryOverpassMirror(mainQuery, 14000);
+
+    if (!elements || !Array.isArray(elements) || elements.length === 0) {
+        const fallbackQuery = buildQuery('major', false);
+        elements = await queryOverpassMirror(fallbackQuery, 9000);
+    }
+
+    if (!elements || !Array.isArray(elements) || elements.length === 0) {
+        const minimalQuery = `[out:json][timeout:15][maxsize:15000000];(way["waterway"~"river|canal"](${s},${w},${n},${e});way["highway"~"motorway|trunk|primary|secondary"](${s},${w},${n},${e}););out geom qt;`;
+        elements = await queryOverpassMirror(minimalQuery, 7000);
+    }
+
+    if (!elements || !Array.isArray(elements) || elements.length === 0) {
+        throw new Error("Impossible de récupérer les routes et fleuves sur cette zone. Essayez de zoomer un peu plus sur la zone souhaitée.");
+    }
+
+    function mercatorY(lat) {
+        const rad = Math.max(-85, Math.min(85, lat)) * Math.PI / 180;
+        return Math.log(Math.tan(Math.PI / 4 + rad / 2));
+    }
+    const northMerc = mercatorY(bbox.north);
+    const southMerc = mercatorY(bbox.south);
+    const deltaMerc = northMerc - southMerc;
+    const deltaLon = bbox.east - bbox.west;
+
+    function toNormPoint(pt) {
+        const lat = pt.lat;
+        const lon = pt.lon !== undefined ? pt.lon : pt.lng;
+        const x = (lon - bbox.west) / deltaLon;
+        const y = (northMerc - mercatorY(lat)) / deltaMerc;
+        return {
+            x: Math.max(-0.05, Math.min(1.05, x)),
+            y: Math.max(-0.05, Math.min(1.05, y))
+        };
+    }
+
+    const waterways = [];
+    const waterBodies = [];
+    const motorways = [];
+    const roadsMajor = [];
+    const roadsMinor = [];
+
+    for (const el of elements) {
+        if (el.type !== 'way' || !Array.isArray(el.geometry) || el.geometry.length < 2) continue;
+        const tags = el.tags || {};
+        const pts = el.geometry.map(toNormPoint);
+
+        const isWaterSurface = (tags.natural === 'water' || tags.water || tags.landuse === 'basin' || tags.landuse === 'reservoir' || tags.waterway === 'riverbank');
+        const isClosed = (Math.abs(el.geometry[0].lat - el.geometry[el.geometry.length - 1].lat) < 0.0001 &&
+                          Math.abs(el.geometry[0].lon - el.geometry[el.geometry.length - 1].lon) < 0.0001);
+
+        if (isWaterSurface || (isClosed && tags.waterway)) {
+            if (options.includeWaterbodies !== false) {
+                waterBodies.push({ id: el.id, name: tags.name || '', points: pts });
+            }
+        } else if (tags.waterway) {
+            if (options.includeWaterways !== false) {
+                waterways.push({ id: el.id, name: tags.name || '', points: pts, type: tags.waterway });
+            }
+        }
+
+        if (tags.highway) {
+            const hw = tags.highway;
+            if (hw === 'motorway' || hw === 'motorway_link' || hw === 'trunk' || hw === 'trunk_link') {
+                if (options.includeMotorways !== false) {
+                    motorways.push({ id: el.id, name: tags.name || '', points: pts, hw });
+                }
+            } else if (hw === 'primary' || hw === 'primary_link' || hw === 'secondary' || hw === 'secondary_link') {
+                if (options.includePrimary !== false) {
+                    roadsMajor.push({ id: el.id, name: tags.name || '', points: pts, hw });
+                }
+            } else {
+                if (options.includeResidential !== false) {
+                    roadsMinor.push({ id: el.id, name: tags.name || '', points: pts, hw });
+                }
+            }
         }
     }
 
-    // Proxy CORS de secours si tous les serveurs directs sont satures
-    try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs + 1500);
-        const target = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`;
-        const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`;
-        const res = await fetch(proxyUrl, { signal: controller.signal });
-        clearTimeout(timer);
-        if (res.ok) {
-            const data = await res.json();
-            if (data && data.elements && data.elements.length > 0) return data.elements;
-        }
-    } catch (e) {}
-
-    return null;
+    return {
+        waterways,
+        waterBodies,
+        motorways,
+        roadsMajor,
+        roadsMinor,
+        cities: [],
+        totalFeatures: waterways.length + waterBodies.length + motorways.length + roadsMajor.length + roadsMinor.length
+    };
 }
 
 // 1. GEOAPIFY PLACES API (Natif Front-end, rapide, gere nativement le CORS)
@@ -1000,15 +1671,26 @@ const POSTER_THEMES = {
         cardClass: 'theme-sepia'
     },
     gold: {
-        name: 'Noir & Or',
-        bg: '#18181b',
+        name: 'Noir & Or (Nuit Lumineuse)',
+        bg: '#08090d',
         isDark: true,
-        minorColor: 'rgba(254, 240, 138, 0.55)',
-        majorColor: '#fef08a',
-        peakColor: '#fef08a',
-        textColor: '#fef08a',
-        subtleLine: 'rgba(254, 240, 138, 0.30)',
+        minorColor: 'rgba(217, 119, 6, 0.65)',
+        majorColor: '#fde047',
+        peakColor: '#fde047',
+        textColor: '#fde047',
+        subtleLine: 'rgba(253, 224, 71, 0.35)',
         cardClass: 'theme-gold'
+    },
+    philadelphia: {
+        name: 'Philadelphie (Bleu & Argent)',
+        bg: '#0f3342',
+        isDark: true,
+        minorColor: 'rgba(94, 234, 212, 0.60)',
+        majorColor: '#c9d3dc',
+        peakColor: '#c9d3dc',
+        textColor: '#c9d3dc',
+        subtleLine: 'rgba(201, 211, 220, 0.35)',
+        cardClass: 'theme-dark'
     },
     transparent: {
         name: 'Fond Transparent',
@@ -1061,10 +1743,12 @@ function getLabelsTileUrl() {
  * 3. ÉTAT GLOBAL DE L'APPLICATION (APP STATE)
  * ------------------------------------------------------------------------------
  */
+let studioFontRenderToken = 0;
+
 const appState = {
-    // Mode d'action principal : 'vector' (Courbes DEM) ou 'raster' (Dalles IGN)
+    // Mode d'action principal : 'vector' (Courbes DEM), 'raster' (Dalles IGN), ou 'roads' (Routes & Fleuves)
     activeMode: 'vector',
-    navBasemapKey: 'openTopo', // Fond de carte interactif actif pour naviguer
+    navBasemapKey: 'openTopo', // Fond de carte interactif actif pour naviguer (commun à tous les modes)
 
     // Mise en page texte : 'poster' (Cartouche & Cadre), 'minimal' (Éditorial bas), 'pure' (0 texte)
     layoutMode: 'poster',
@@ -1074,13 +1758,13 @@ const appState = {
     rasterLayerKey: 'openTopo',
     formatKey: 'a4-portrait',
     customFormat: { w: 50, h: 70, unit: 'cm' },
-    themeKey: 'emerald',
+    themeKey: 'dark',
     resolutionKey: 'hd',
     fontFamily: 'Montserrat',
     titleText: 'MASSIF DU VERCORS',
     subtitleText: '45.034° N, 5.512° E — ALPES FRANÇAISES',
 
-    // Paramètres du Moteur Vectoriel
+    // Paramètres du Moteur Vectoriel Topo
     contourStep: 50,
     majorMultiplier: 4, // Multiplicateur de fréquence des courbes maîtresses (×2, ×3, ×4, ×5, ×10, ou 1)
     smoothingLevel: 3, // 0 à 8 (8 = arrondi maximal)
@@ -1095,24 +1779,49 @@ const appState = {
     showScaleNorth: true,
     highlightTrails: true,     // Mode raster rando : faire ressortir les sentiers balisés
 
+    // Paramètres du Moteur Routes & Fleuves
+    roadsDensity: 'standard',  // 'all', 'standard', 'major', 'minimal'
+    roadsIncludeWaterways: true,
+    roadsIncludeWaterbodies: true,
+    roadsIncludeMotorways: true,
+    roadsIncludePrimary: true,
+    roadsIncludeResidential: true,
+    showWaterways: true,
+    showWaterBodies: true,
+    showMotorways: true,
+    showRoadsMajor: true,
+    showRoadsMinor: true,
+
     // Couleurs personnalisées en direct dans la page studio
     customColors: {
-        bg: '#14382c',          // Fond de l'affiche (bords, cartouche, texte)
-        mapBg: '#14382c',       // Fond de la carte sous les lignes
+        bg: '#0B0D10',          // Fond de l'affiche (bords, cartouche, texte)
+        mapBg: '#0B0D10',       // Fond de la carte sous les lignes
         linkBgs: true,          // Si true, les deux fonds sont liés
         isTransparent: false,
         isMapTransparent: false,
-        majorColor: '#ffffff',
-        minorColor: '#a7f3d0',
-        citiesColor: '#ffffff',
-        peaksColor: '#ffffff',
-        textColor: '#ffffff',
+        majorColor: '#E5C158',  // Courbes maîtresses (topo) / primary
+        minorColor: '#A68938',  // Courbes secondaires (topo) / secondary
+        roadsMajorColor: '#E5C158', // Grands axes urbains / primary
+        roadsMinorColor: '#A68938', // Rues secondaires / secondary
+        water: '#181F29',       // Couleur des fleuves & plans d'eau
+        waterColor: '#181F29',
+        waterFillColor: '#181F29',
+        citiesColor: '#F0D27A', // Villes
+        peaksColor: '#E5C158',  // Sommets
+        textColor: '#F0D27A',   // Titres & cartouche
         majorWidth: 1.8,
-        minorWidth: 0.9
+        minorWidth: 0.9,
+        roadsMajorWidth: 2.0,
+        roadsMinorWidth: 0.8,
+        waterWidth: 2.4
     },
 
     // Cache des données vectorielles compilées
     compiledData: null,
+    toponymyReady: false,
+    toponymyLoading: false,
+    toponymyError: null,
+    toponymyRequestId: 0,
     studioZoom: 'fit',
 
     sidebarCollapsed: false,
@@ -1183,9 +1892,15 @@ function initMap() {
 function updateInteractiveMapDisplay() {
     if (appState.baseLayer) {
         appState.map.removeLayer(appState.baseLayer);
+        appState.baseLayer = null;
     }
-
-    const providerKey = (appState.activeMode === 'vector') ? appState.navBasemapKey : appState.rasterLayerKey;
+    let providerKey = 'openTopo';
+    if (appState.activeMode === 'raster') {
+        providerKey = appState.rasterLayerKey;
+    } else {
+        // En mode 'vector' (Courbes Topo) et en mode 'roads' (Routes & Fleuves), on utilise le même fond interactif libre et gratuit (sans clé API)
+        providerKey = appState.navBasemapKey;
+    }
     const prov = TILE_PROVIDERS[providerKey] || TILE_PROVIDERS.openTopo;
 
     appState.baseLayer = L.tileLayer(prov.url, {
@@ -1199,16 +1914,13 @@ function updateInteractiveMapDisplay() {
     const tilePane = document.querySelector('.leaflet-tile-pane');
     if (!mapContainer || !tilePane) return;
 
-    // Filtre thématique élégant et non-agressif
-    if (appState.activeMode === 'vector') {
-        if (appState.navBasemapKey === 'cartoDark') {
-            mapContainer.style.backgroundColor = '#0b0f17';
-            tilePane.style.filter = 'none';
-        } else if (appState.navBasemapKey === 'ignOrtho') {
+    // Filtre thématique élégant et non-agressif (identique pour les modes vectoriel et routes & fleuves)
+    if (appState.activeMode === 'vector' || appState.activeMode === 'roads') {
+        if (appState.navBasemapKey === 'ignOrtho') {
             mapContainer.style.backgroundColor = '#0b0f17';
             tilePane.style.filter = 'brightness(90%) contrast(105%)';
         } else {
-            // Relief OpenTopo ou Plan standard avec teinte thématique douce
+            // Relief OpenTopo, Plan IGN ou OSM Standard avec teinte thématique douce
             applySubtleThemeFilter(appState.themeKey);
         }
     } else {
@@ -1222,10 +1934,7 @@ function applySubtleThemeFilter(themeKey) {
     const tilePane = document.querySelector('.leaflet-tile-pane');
     if (!tilePane || !mapContainer) return;
 
-    if (themeKey === 'emerald') {
-        mapContainer.style.backgroundColor = '#14382c';
-        tilePane.style.filter = 'grayscale(80%) contrast(140%) brightness(95%) sepia(20%) hue-rotate(90deg)';
-    } else if (themeKey === 'dark' || themeKey === 'transparent') {
+    if (themeKey === 'dark' || themeKey === 'emerald' || themeKey === 'transparent') {
         mapContainer.style.backgroundColor = '#0f172a';
         tilePane.style.filter = 'grayscale(100%) contrast(130%) brightness(95%)';
     } else if (themeKey === 'blueprint') {
@@ -2445,7 +3154,8 @@ function drawPosterArtCartouche(ctx, mapX, mapY, mapW, mapH, marginX, marginY, c
     const centerX = canvasW / 2;
 
     // Titre Principal
-    const titleFontSize = Math.round(canvasW * 0.038);
+    const typeScale = Math.min(canvasW, canvasH * 1.65);
+    const titleFontSize = Math.round(typeScale * 0.038);
     ctx.font = `800 ${titleFontSize}px '${appState.fontFamily}', sans-serif`;
     ctx.fillStyle = theme.textColor;
     ctx.textAlign = 'center';
@@ -2456,7 +3166,7 @@ function drawPosterArtCartouche(ctx, mapX, mapY, mapW, mapH, marginX, marginY, c
 
     // Sous-titre
     if (appState.subtitleText) {
-        const subFontSize = Math.round(canvasW * 0.0135);
+        const subFontSize = Math.round(typeScale * 0.0135);
         ctx.font = `500 ${subFontSize}px '${appState.fontFamily}', sans-serif`;
         ctx.fillStyle = theme.textColor;
         ctx.globalAlpha = 0.85;
@@ -2476,7 +3186,7 @@ function drawPosterArtCartouche(ctx, mapX, mapY, mapW, mapH, marginX, marginY, c
 
     // Coordonnées, Échelle, Nord
     const metaY = sepY + Math.round(canvasH * 0.022);
-    const metaFontSize = Math.round(canvasW * 0.010);
+    const metaFontSize = Math.round(typeScale * 0.010);
     ctx.font = `600 ${metaFontSize}px '${appState.fontFamily}', sans-serif`;
     ctx.fillStyle = theme.textColor;
 
@@ -2524,7 +3234,8 @@ function drawPosterFullbleedCartouche(ctx, mapX, mapY, mapW, mapH, cartoucheH, c
     const centerX = canvasW / 2;
 
     // Titre Principal
-    const titleFontSize = Math.round(canvasW * 0.038);
+    const typeScale = Math.min(canvasW, canvasH * 1.65);
+    const titleFontSize = Math.round(typeScale * 0.038);
     ctx.font = `800 ${titleFontSize}px '${appState.fontFamily}', sans-serif`;
     ctx.fillStyle = theme.textColor;
     ctx.textAlign = 'center';
@@ -2535,7 +3246,7 @@ function drawPosterFullbleedCartouche(ctx, mapX, mapY, mapW, mapH, cartoucheH, c
 
     // Sous-titre
     if (appState.subtitleText) {
-        const subFontSize = Math.round(canvasW * 0.0135);
+        const subFontSize = Math.round(typeScale * 0.0135);
         ctx.font = `500 ${subFontSize}px '${appState.fontFamily}', sans-serif`;
         ctx.fillStyle = theme.textColor;
         ctx.globalAlpha = 0.85;
@@ -2555,7 +3266,7 @@ function drawPosterFullbleedCartouche(ctx, mapX, mapY, mapW, mapH, cartoucheH, c
 
     // Coordonnées, Échelle, Nord
     const metaY = sepY + Math.round(canvasH * 0.020);
-    const metaFontSize = Math.round(canvasW * 0.010);
+    const metaFontSize = Math.round(typeScale * 0.010);
     ctx.font = `600 ${metaFontSize}px '${appState.fontFamily}', sans-serif`;
     ctx.fillStyle = theme.textColor;
 
@@ -2876,6 +3587,7 @@ async function renderRasterTilesEngine(ctx, mapX, mapY, mapW, mapH, canvasW) {
 
 function generatePureSVG(vectorData, mapW, mapH, mapX, mapY, canvasW, canvasH, colorsInput, fontInput) {
     const isRaster = vectorData && vectorData.mode === 'raster';
+    const isRoads = vectorData && vectorData.mode === 'roads';
     const contours = (vectorData && vectorData.contours) ? vectorData.contours : [];
     const peaks = (vectorData && vectorData.peaks) ? vectorData.peaks : [];
     const cities = (vectorData && vectorData.cities) ? vectorData.cities : [];
@@ -2890,17 +3602,27 @@ function generatePureSVG(vectorData, mapW, mapH, mapX, mapY, canvasW, canvasH, c
     const previewBaseW = (format.ratio >= 1 ? 1800 : Math.round(1800 * format.ratio));
     const scaleRatio = canvasW / previewBaseW;
 
-    const bgColor = colors.bg || '#14382c';
+    const bgColor = colors.bg || '#0B0D10';
     const mapBgColor = colors.mapBg || bgColor;
     const isTransparent = colors.isTransparent || bgColor === 'transparent';
     const isMapTransparent = colors.isMapTransparent || mapBgColor === 'transparent';
-    const majorColor = colors.majorColor || '#ffffff';
-    const minorColor = colors.minorColor || '#a7f3d0';
-    const citiesColor = colors.citiesColor || colors.textColor || '#ffffff';
-    const peaksColor = colors.peaksColor || colors.textColor || '#ffffff';
-    const textColor = colors.textColor || '#ffffff';
+    const majorColor = colors.primary || colors.majorColor || '#D4AF37';
+    const minorColor = colors.secondary || colors.minorColor || '#786228';
+    const textColor = colors.text || colors.textColor || '#E6C768';
+    const citiesColor = colors.text || colors.citiesColor || textColor;
+    const peaksColor = colors.primary || colors.peaksColor || majorColor;
     const minorWidth = (Math.max(0.5, (colors.minorWidth !== undefined ? colors.minorWidth : 0.8) * scaleRatio)).toFixed(2);
     const majorWidth = (Math.max(1.2, (colors.majorWidth !== undefined ? colors.majorWidth : 1.8) * scaleRatio)).toFixed(2);
+
+    // Propriétés routes & fleuves
+    const waterColor = colors.water || colors.waterFillColor || colors.waterColor || '#181F29';
+    const waterFillColor = colors.water || colors.waterFillColor || colors.waterColor || '#181F29';
+    const roadsMajorColor = colors.primary || colors.roadsMajorColor || '#E5C158';
+    const roadsMinorColor = colors.secondary || colors.roadsMinorColor || '#A68938';
+    const waterWidth = (Math.max(1.0, (colors.waterWidth !== undefined ? colors.waterWidth : 2.8) * scaleRatio)).toFixed(2);
+    const roadsMajorWidth = (Math.max(1.0, (colors.roadsMajorWidth !== undefined ? colors.roadsMajorWidth : 2.0) * scaleRatio)).toFixed(2);
+    const roadsMinorWidth = (Math.max(0.4, (colors.roadsMinorWidth !== undefined ? colors.roadsMinorWidth : 0.8) * scaleRatio)).toFixed(2);
+    const motorwaysWidth = (Math.max(1.4, ((colors.roadsMajorWidth !== undefined ? colors.roadsMajorWidth : 2.0) * 1.35) * scaleRatio)).toFixed(2);
 
     let svg = `<?xml version="1.0" encoding="UTF-8"?>\n`;
     svg += `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${canvasW} ${canvasH}" width="${canvasW}" height="${canvasH}">\n`;
@@ -2929,6 +3651,128 @@ function generatePureSVG(vectorData, mapW, mapH, mapX, mapY, canvasW, canvasH, c
         // Mode Dalles Raster : integration de la carte haute definition
         const rasterDataUrl = vectorData.rasterCanvas.toDataURL('image/jpeg', 0.92);
         svg += `    <image href="${rasterDataUrl}" x="0" y="0" width="${mapW}" height="${mapH}" preserveAspectRatio="none"/>\n`;
+    } else if (isRoads) {
+        // Mode Routes & Fleuves : Tracés vectoriels purs (Esthétique Urbaine & Nuit Éclairée)
+        const isDarkBg = isColorDark(mapBgColor);
+
+        // 1. Cours d'eau linéaires (Affluents, ruisseaux, canaux) — tracés en premier sous les grands fleuves
+        if (appState.showWaterways && vectorData.waterways && vectorData.waterways.length > 0) {
+            const streamStroke = waterColor || waterFillColor;
+            svg += `    <g id="fleuves-cours-deau" fill="none" stroke="${escapeXmlAttr(streamStroke)}" stroke-width="${(waterWidth * 0.85).toFixed(2)}" opacity="0.85" stroke-linecap="round" stroke-linejoin="round">\n`;
+            for (const way of vectorData.waterways) {
+                if (!way.points || way.points.length < 2) continue;
+                let d = '';
+                for (let i = 0; i < way.points.length; i++) {
+                    const pt = way.points[i];
+                    const sx = (pt.x * mapW).toFixed(1);
+                    const sy = (pt.y * mapH).toFixed(1);
+                    d += (i === 0 ? `M ${sx} ${sy}` : ` L ${sx} ${sy}`);
+                }
+                svg += `      <path d="${d}"/>\n`;
+            }
+            svg += `    </g>\n`;
+        }
+
+        // 2. Surfaces en eau (Mers, Lacs, Fleuves larges, Bassins) — la vraie forme sculpturale des fleuves
+        if (appState.showWaterBodies && vectorData.waterBodies && vectorData.waterBodies.length > 0) {
+            const waterStroke = (waterColor && waterColor !== 'transparent' && waterColor !== waterFillColor) ? waterColor : waterFillColor;
+            const waterBorderWidth = (waterColor === waterFillColor) ? '0.8' : (waterWidth * 0.4).toFixed(2);
+            svg += `    <g id="surfaces-aquatiques" fill="${escapeXmlAttr(waterFillColor)}" stroke="${escapeXmlAttr(waterStroke)}" stroke-width="${waterBorderWidth}" stroke-linejoin="round">\n`;
+            for (const body of vectorData.waterBodies) {
+                if (!body.points || body.points.length < 3) continue;
+                let d = '';
+                for (let i = 0; i < body.points.length; i++) {
+                    const pt = body.points[i];
+                    const sx = (pt.x * mapW).toFixed(1);
+                    const sy = (pt.y * mapH).toFixed(1);
+                    d += (i === 0 ? `M ${sx} ${sy}` : ` L ${sx} ${sy}`);
+                }
+                d += ' Z';
+                svg += `      <path d="${d}"/>\n`;
+            }
+            svg += `    </g>\n`;
+        }
+
+        // 3. Rues secondaires & locales (Maillage urbain délicat / Tapis de lumière nocturne)
+        if (appState.showRoadsMinor && vectorData.roadsMinor && vectorData.roadsMinor.length > 0) {
+            const mWidth = (roadsMinorWidth * 0.75).toFixed(2);
+            svg += `    <g id="rues-secondaires" fill="none" stroke="${escapeXmlAttr(roadsMinorColor)}" stroke-width="${mWidth}" opacity="0.90" stroke-linecap="round" stroke-linejoin="round">\n`;
+            for (const way of vectorData.roadsMinor) {
+                if (!way.points || way.points.length < 2) continue;
+                let d = '';
+                for (let i = 0; i < way.points.length; i++) {
+                    const pt = way.points[i];
+                    const sx = (pt.x * mapW).toFixed(1);
+                    const sy = (pt.y * mapH).toFixed(1);
+                    d += (i === 0 ? `M ${sx} ${sy}` : ` L ${sx} ${sy}`);
+                }
+                svg += `      <path d="${d}"/>\n`;
+            }
+            svg += `    </g>\n`;
+        }
+
+        // 4. Routes principales & boulevards (Lignes dorées éclatantes)
+        if (appState.showRoadsMajor && vectorData.roadsMajor && vectorData.roadsMajor.length > 0) {
+            svg += `    <g id="routes-principales" fill="none" stroke="${escapeXmlAttr(roadsMajorColor)}" stroke-width="${roadsMajorWidth}" opacity="0.90" stroke-linecap="round" stroke-linejoin="round">\n`;
+            for (const way of vectorData.roadsMajor) {
+                if (!way.points || way.points.length < 2) continue;
+                let d = '';
+                for (let i = 0; i < way.points.length; i++) {
+                    const pt = way.points[i];
+                    const sx = (pt.x * mapW).toFixed(1);
+                    const sy = (pt.y * mapH).toFixed(1);
+                    d += (i === 0 ? `M ${sx} ${sy}` : ` L ${sx} ${sy}`);
+                }
+                svg += `      <path d="${d}"/>\n`;
+            }
+            svg += `    </g>\n`;
+        }
+
+        // 5. Autoroutes & voies express (Axes majeurs incandescents)
+        if (appState.showMotorways && vectorData.motorways && vectorData.motorways.length > 0) {
+            const hwWidth = (roadsMajorWidth * 1.45).toFixed(2);
+            svg += `    <g id="autoroutes-voies-rapides" fill="none" stroke="${escapeXmlAttr(roadsMajorColor)}" stroke-width="${hwWidth}" opacity="1.0" stroke-linecap="round" stroke-linejoin="round">\n`;
+            for (const way of vectorData.motorways) {
+                if (!way.points || way.points.length < 2) continue;
+                let d = '';
+                for (let i = 0; i < way.points.length; i++) {
+                    const pt = way.points[i];
+                    const sx = (pt.x * mapW).toFixed(1);
+                    const sy = (pt.y * mapH).toFixed(1);
+                    d += (i === 0 ? `M ${sx} ${sy}` : ` L ${sx} ${sy}`);
+                }
+                svg += `      <path d="${d}"/>\n`;
+            }
+            svg += `    </g>\n`;
+        }
+
+        // 6. Villes & communes
+        if (appState.showLabels && cities.length > 0) {
+            const scaleX = mapW / 1000;
+            const scaleY = mapH / 1000;
+            svg += `    <g id="villes-communes" fill="${escapeXmlAttr(citiesColor)}">\n`;
+            for (const c of cities) {
+                if (!c || isNaN(c.gridX) || isNaN(c.gridY)) continue;
+                const px = c.gridX * scaleX;
+                const py = c.gridY * scaleY;
+                if (px < -5 || px > mapW + 5 || py < -5 || py > mapH + 5) continue;
+                const isCity = c.type === 'city';
+                const isTown = c.type === 'town';
+                const dotR = isCity ? 3.5 : (isTown ? 2.5 : 2);
+                const fSize = isCity ? Math.round(canvasW * 0.0088) : Math.round(canvasW * 0.0074);
+                const fWeight = isCity ? '700' : '600';
+                const cityName = (c.name || '').toUpperCase();
+                if (!cityName) continue;
+
+                const isNearRight = (px + dotR + 80 > mapW);
+                const textAnchor = isNearRight ? 'end' : 'start';
+                const textX = isNearRight ? (px - dotR - 5).toFixed(1) : (px + dotR + 5).toFixed(1);
+
+                svg += `      <circle cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="${dotR}"/>\n`;
+                svg += `      <text x="${textX}" y="${py.toFixed(1)}" font-size="${fSize}" font-weight="${fWeight}" text-anchor="${textAnchor}" dominant-baseline="central">${escapeXmlText(cityName)}</text>\n`;
+            }
+            svg += `    </g>\n`;
+        }
     } else {
         // Mode Vectoriel : Courbes de niveau, cotes, villes et sommets
         const scaleX = mapW / Math.max(1, gridW - 1);
@@ -2940,7 +3784,7 @@ function generatePureSVG(vectorData, mapW, mapH, mapX, mapY, canvasW, canvasH, c
         if (contours && contours.length > 0) {
             // Courbes secondaires
             if (appState.showContours) {
-                svg += `    <g id="courbes-secondaires" fill="none" stroke="${escapeXmlAttr(minorColor)}" stroke-width="${minorWidth}" stroke-linecap="round" stroke-linejoin="round" opacity="0.75">\n`;
+                svg += `    <g id="courbes-secondaires" fill="none" stroke="${escapeXmlAttr(minorColor)}" stroke-width="${minorWidth}" stroke-linecap="round" stroke-linejoin="round" opacity="0.90">\n`;
                 for (const c of contours) {
                     if (!isContourMajor(c, step, multiplier)) {
                         for (const polyline of (c.polylines || [])) {
@@ -3182,32 +4026,67 @@ async function searchLocation(query) {
     const cleanQuery = query.trim();
 
     const searchBtn = document.getElementById('btn-search');
-    searchBtn.disabled = true;
-    searchBtn.style.opacity = '0.5';
+    if (searchBtn) {
+        searchBtn.disabled = true;
+        searchBtn.style.opacity = '0.5';
+    }
 
     try {
-        const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(cleanQuery)}&limit=1`);
-        const data = await response.json();
+        let lat = null, lon = null, mainPlace = '', subRegion = '';
 
-        if (data && data.length > 0) {
-            const result = data[0];
-            const lat = parseFloat(result.lat);
-            const lon = parseFloat(result.lon);
+        // 1. Tenter l'API Photon de Komoot (CORS natif, ultra-rapide < 150ms, sans clé API)
+        try {
+            const ctrl = new AbortController();
+            const to = setTimeout(() => ctrl.abort(), 3500);
+            const photonRes = await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(cleanQuery)}&limit=1`, { signal: ctrl.signal });
+            clearTimeout(to);
+            if (photonRes.ok) {
+                const pData = await photonRes.json();
+                if (pData && pData.features && pData.features.length > 0) {
+                    const feat = pData.features[0];
+                    lon = feat.geometry.coordinates[0];
+                    lat = feat.geometry.coordinates[1];
+                    const props = feat.properties || {};
+                    mainPlace = (props.name || cleanQuery).toUpperCase();
+                    const parts = [];
+                    if (props.state && props.state !== props.name) parts.push(props.state);
+                    if (props.country) parts.push(props.country);
+                    subRegion = parts.join(' — ');
+                }
+            }
+        } catch (e) {
+            // Repli vers Nominatim
+        }
 
+        // 2. Repli Nominatim OpenStreetMap si Photon n'a pas répondu
+        if (lat === null || lon === null) {
+            const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(cleanQuery)}&limit=1`);
+            const data = await response.json();
+            if (data && data.length > 0) {
+                const result = data[0];
+                lat = parseFloat(result.lat);
+                lon = parseFloat(result.lon);
+                const titleParts = result.display_name.split(',');
+                mainPlace = titleParts[0].trim().toUpperCase();
+                subRegion = (titleParts[1] ? titleParts[1].trim() : '') + (titleParts[titleParts.length - 1] ? ' — ' + titleParts[titleParts.length - 1].trim() : '');
+            }
+        }
+
+        if (lat !== null && lon !== null) {
             appState.map.flyTo([lat, lon], 13, {
                 duration: 1.8,
                 easeLinearity: 0.25
             });
 
-            const titleParts = result.display_name.split(',');
-            const mainPlace = titleParts[0].trim().toUpperCase();
-            const subRegion = (titleParts[1] ? titleParts[1].trim() : '') + (titleParts[titleParts.length - 1] ? ' — ' + titleParts[titleParts.length - 1].trim() : '');
-
-            document.getElementById('input-title').value = mainPlace;
+            const inputTitle = document.getElementById('input-title');
+            if (inputTitle) inputTitle.value = mainPlace;
             appState.titleText = mainPlace;
 
-            const gpsString = `${lat.toFixed(3)}° N, ${lon.toFixed(3)}° E ${subRegion ? '— ' + subRegion.toUpperCase() : ''}`;
-            document.getElementById('input-subtitle').value = gpsString;
+            const latDir = lat >= 0 ? 'N' : 'S';
+            const lonDir = lon >= 0 ? 'E' : 'O';
+            const gpsString = `${Math.abs(lat).toFixed(3)}° ${latDir}, ${Math.abs(lon).toFixed(3)}° ${lonDir} ${subRegion ? '— ' + subRegion.toUpperCase() : ''}`;
+            const inputSub = document.getElementById('input-subtitle');
+            if (inputSub) inputSub.value = gpsString;
             appState.subtitleText = gpsString;
 
             updateLivePreview();
@@ -3217,8 +4096,10 @@ async function searchLocation(query) {
     } catch (err) {
         console.error("Erreur de recherche :", err);
     } finally {
-        searchBtn.disabled = false;
-        searchBtn.style.opacity = '1';
+        if (searchBtn) {
+            searchBtn.disabled = false;
+            searchBtn.style.opacity = '1';
+        }
     }
 }
 
@@ -3244,7 +4125,7 @@ function setupEventListeners() {
         });
     });
 
-    // 3. Bascule Mode Vectoriel vs Mode Raster
+    // 3. Bascule Mode Vectoriel vs Mode Raster vs Mode Routes & Fleuves
     document.querySelectorAll('.mode-tab-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             document.querySelectorAll('.mode-tab-btn').forEach(b => b.classList.remove('active'));
@@ -3253,17 +4134,53 @@ function setupEventListeners() {
 
             const secVector = document.getElementById('section-vector-settings');
             const secRaster = document.getElementById('section-raster-settings');
+            const secRoads = document.getElementById('section-roads-settings');
+            if (secVector) secVector.style.display = appState.activeMode === 'vector' ? 'flex' : 'none';
+            if (secRaster) secRaster.style.display = appState.activeMode === 'raster' ? 'flex' : 'none';
+            if (secRoads) secRoads.style.display = appState.activeMode === 'roads' ? 'flex' : 'none';
 
-            if (appState.activeMode === 'vector') {
-                secVector.style.display = 'flex';
-                secRaster.style.display = 'none';
-            } else {
-                secVector.style.display = 'none';
-                secRaster.style.display = 'flex';
+            const btnCompileSpan = document.querySelector('#btn-compile-and-customize span');
+            if (btnCompileSpan) {
+                if (appState.activeMode === 'roads') {
+                    btnCompileSpan.innerText = 'Générer le plan urbain & Personnaliser';
+                } else if (appState.activeMode === 'raster') {
+                    btnCompileSpan.innerText = 'Compiler la carte rando & Personnaliser';
+                } else {
+                    btnCompileSpan.innerText = 'Compiler les lignes & Personnaliser';
+                }
             }
+
             updateInteractiveMapDisplay();
         });
     });
+
+    // 3.bis Réglages du Mode Routes & Fleuves
+    const selectRoadsDensity = document.getElementById('select-roads-density');
+    const labelRoadsDensity = document.getElementById('roads-density-label');
+    if (selectRoadsDensity) {
+        selectRoadsDensity.addEventListener('change', (e) => {
+            appState.roadsDensity = e.target.value;
+            if (labelRoadsDensity) {
+                const mapLabels = { all: 'Intégrale', standard: 'Standard', major: 'Épuré', minimal: 'Minimaliste' };
+                labelRoadsDensity.innerText = mapLabels[e.target.value] || 'Standard';
+            }
+        });
+    }
+
+    const bindRoadsToggle = (id, key) => {
+        const el = document.getElementById(id);
+        if (el) {
+            el.addEventListener('change', (e) => {
+                appState[key] = e.target.checked;
+            });
+        }
+    };
+    bindRoadsToggle('check-include-waterways', 'roadsIncludeWaterways');
+    bindRoadsToggle('check-include-waterbodies', 'roadsIncludeWaterbodies');
+    bindRoadsToggle('check-include-motorways', 'roadsIncludeMotorways');
+    bindRoadsToggle('check-include-primary-roads', 'roadsIncludePrimary');
+    bindRoadsToggle('check-include-residential-roads', 'roadsIncludeResidential');
+
 
     // 4. Barre latérale rétractable
     const toggleBtn = document.getElementById('sidebar-toggle-btn');
@@ -3277,11 +4194,13 @@ function setupEventListeners() {
             appState.sidebarCollapsed = !appState.sidebarCollapsed;
             if (appState.sidebarCollapsed) {
                 sidebar.classList.add('collapsed');
+                toggleBtn.classList.add('is-collapsed');
                 iconCollapse.style.display = 'none';
                 iconExpand.style.display = 'block';
                 cropOverlay.classList.add('fullscreen-overlay');
             } else {
                 sidebar.classList.remove('collapsed');
+                toggleBtn.classList.remove('is-collapsed');
                 iconCollapse.style.display = 'block';
                 iconExpand.style.display = 'none';
                 cropOverlay.classList.remove('fullscreen-overlay');
@@ -3454,20 +4373,107 @@ function setupEventListeners() {
         selectFont.addEventListener('change', (e) => {
             appState.fontFamily = e.target.value;
             updateLivePreview();
+            refreshStudioPreviewForFont();
         });
     }
 
-    // 13. Synchronisation GPS Auto Carte
+    // 13. Synchronisation GPS Auto Carte (Identification automatique de la ville/sommet le plus proche)
     const btnSyncCoords = document.getElementById('btn-sync-coords');
     if (btnSyncCoords) {
-        btnSyncCoords.addEventListener('click', () => {
-            if (appState.currentCenter) {
-                const latStr = `${appState.currentCenter.lat.toFixed(3)}° N`;
-                const lngStr = `${appState.currentCenter.lng.toFixed(3)}° E`;
-                const newSub = `${latStr}, ${lngStr} — FRANCE`;
-                if (subtitleInput) subtitleInput.value = newSub;
-                appState.subtitleText = newSub;
+        btnSyncCoords.addEventListener('click', async () => {
+            if (!appState.currentCenter) return;
+            const lat = appState.currentCenter.lat;
+            const lng = appState.currentCenter.lng;
+            const origLabel = btnSyncCoords.innerText;
+            btnSyncCoords.innerText = "Recherche...";
+
+            try {
+                let detectedTitle = null;
+                let detectedSub = null;
+
+                // 1. Proximité immédiate avec un lieu remarquable prédéfini (< 25 km)
+                if (typeof PRESET_LOCATIONS !== 'undefined') {
+                    let minDist = Infinity;
+                    let bestLoc = null;
+                    for (const loc of Object.values(PRESET_LOCATIONS)) {
+                        const d = haversineDistanceMeters(lat, lng, loc.coords[0], loc.coords[1]);
+                        if (d < minDist) {
+                            minDist = d;
+                            bestLoc = loc;
+                        }
+                    }
+                    if (bestLoc && minDist < 25000) {
+                        detectedTitle = bestLoc.title;
+                        detectedSub = bestLoc.subtitle;
+                    }
+                }
+
+                // 2. Proximité avec le catalogue local des villes et sommets (< 15 km)
+                if (!detectedTitle && typeof FRENCH_CITIES_CATALOG !== 'undefined') {
+                    let minDistCat = Infinity;
+                    let bestCity = null;
+                    for (const c of FRENCH_CITIES_CATALOG) {
+                        const d = haversineDistanceMeters(lat, lng, c.lat, c.lng);
+                        if (d < minDistCat) {
+                            minDistCat = d;
+                            bestCity = c;
+                        }
+                    }
+                    if (bestCity && minDistCat < 15000) {
+                        detectedTitle = bestCity.name.toUpperCase();
+                    }
+                }
+
+                // 3. Géocodage inverse en ligne (Photon / Komoot avec repli Nominatim)
+                if (!detectedTitle) {
+                    try {
+                        const ctrl = new AbortController();
+                        const to = setTimeout(() => ctrl.abort(), 2500);
+                        const res = await fetch(`https://photon.komoot.io/reverse?lat=${lat.toFixed(5)}&lon=${lng.toFixed(5)}`, { signal: ctrl.signal });
+                        clearTimeout(to);
+                        if (res.ok) {
+                            const data = await res.json();
+                            if (data.features && data.features.length > 0) {
+                                const p = data.features[0].properties;
+                                const place = p.city || p.town || p.village || p.municipality || p.name || p.district;
+                                if (place) {
+                                    detectedTitle = place.toUpperCase();
+                                    const region = p.state || p.country || '';
+                                    if (region) {
+                                        const latDir = lat >= 0 ? 'N' : 'S';
+                                        const lonDir = lng >= 0 ? 'E' : 'O';
+                                        detectedSub = `${Math.abs(lat).toFixed(3)}° ${latDir}, ${Math.abs(lng).toFixed(3)}° ${lonDir} — ${region.toUpperCase()}`;
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e) {}
+                }
+
+                // 4. Fallback si aucun nom trouvé
+                if (!detectedTitle) {
+                    detectedTitle = `POINT ${Math.abs(lat).toFixed(2)}°${lat >= 0 ? 'N' : 'S'}, ${Math.abs(lng).toFixed(2)}°${lng >= 0 ? 'E' : 'O'}`;
+                }
+
+                if (!detectedSub) {
+                    const latDir = lat >= 0 ? 'N' : 'S';
+                    const lonDir = lng >= 0 ? 'E' : 'O';
+                    detectedSub = `${Math.abs(lat).toFixed(3)}° ${latDir}, ${Math.abs(lng).toFixed(3)}° ${lonDir}`;
+                }
+
+                if (titleInput) titleInput.value = detectedTitle;
+                appState.titleText = detectedTitle;
+                if (subtitleInput) subtitleInput.value = detectedSub;
+                appState.subtitleText = detectedSub;
+
+                const studioTitleIn = document.getElementById('studio-input-title');
+                if (studioTitleIn) studioTitleIn.value = detectedTitle;
+                const studioSubIn = document.getElementById('studio-input-subtitle');
+                if (studioSubIn) studioSubIn.value = detectedSub;
+
                 updateLivePreview();
+            } finally {
+                btnSyncCoords.innerText = origLabel;
             }
         });
     }
@@ -3637,6 +4643,9 @@ async function compileContoursAndEnterStudio() {
                 bbox: { ...appState.currentBBox },
                 center: { ...appState.currentCenter }
             };
+            appState.toponymyReady = true;
+            appState.toponymyLoading = false;
+            appState.toponymyError = null;
 
             progressBar.style.width = '100%';
             progressCount.innerText = "Pret !";
@@ -3648,6 +4657,57 @@ async function compileContoursAndEnterStudio() {
         } catch (err) {
             console.error("Erreur durant la generation raster :", err);
             alert(`Erreur de carte raster : ${err.message}`);
+            modal.classList.remove('show');
+            return;
+        }
+    }
+
+    // 1.bis Branche Mode Plan Urbain : Routes & Fleuves
+    if (appState.activeMode === 'roads') {
+        stepTitle.innerText = "Génération du plan urbain d'art...";
+        stepDetail.innerText = "Téléchargement des géométries vectorielles OpenFreeMap (MVT)...";
+        progressBar.style.width = '30%';
+        progressCount.innerText = "Étape 1/3 (30%)";
+        await new Promise(r => setTimeout(r, 60));
+
+        try {
+            const roadsResult = await fetchUrbanRoadsAndWaterways(appState.currentBBox, appState.roadsDensity, {
+                includeWaterways: appState.roadsIncludeWaterways,
+                includeWaterbodies: appState.roadsIncludeWaterbodies,
+                includeMotorways: appState.roadsIncludeMotorways,
+                includePrimary: appState.roadsIncludePrimary,
+                includeResidential: appState.roadsIncludeResidential
+            });
+
+            stepTitle.innerText = "Extraction et vectorisation des réseaux urbains...";
+            stepDetail.innerText = `${roadsResult.totalFeatures.toLocaleString()} éléments géométriques intégrés au plan d'art.`;
+            progressBar.style.width = '75%';
+            progressCount.innerText = "Étape 2/3 (75%)";
+            await new Promise(r => setTimeout(r, 60));
+
+            appState.compiledData = {
+                mode: 'roads',
+                waterways: roadsResult.waterways,
+                waterBodies: roadsResult.waterBodies,
+                motorways: roadsResult.motorways,
+                roadsMajor: roadsResult.roadsMajor,
+                roadsMinor: roadsResult.roadsMinor,
+                cities: roadsResult.cities || [],
+                bbox: { ...appState.currentBBox },
+                center: { ...appState.currentCenter }
+            };
+
+            progressBar.style.width = '100%';
+            progressCount.innerText = "Prêt !";
+            await new Promise(r => setTimeout(r, 100));
+            modal.classList.remove('show');
+
+            enterStudioMode();
+            loadRoadsToponymyInBackground();
+            return;
+        } catch (err) {
+            console.error("Erreur durant la compilation des routes & fleuves :", err);
+            alert(`Erreur de récupération des données urbaines : ${err.message}`);
             modal.classList.remove('show');
             return;
         }
@@ -3673,34 +4733,6 @@ async function compileContoursAndEnterStudio() {
         // Isocontours Marching Squares
         const contours = computeMarchingSquaresContours(grid, gridW, gridH, appState.contourStep);
 
-        // Recherche des sommets reels
-        stepTitle.innerText = "Identification des sommets reels & toponymie...";
-        stepDetail.innerText = "Interrogation de la base toponymique des reliefs...";
-        progressBar.style.width = '75%';
-        progressCount.innerText = "Etape 3/4 (75%)";
-        let peaks = [];
-        try {
-            peaks = await extractMountainPeaks(grid, gridW, gridH, appState.currentBBox, Math.max(40, minH + (maxH - minH) * 0.12));
-            stepDetail.innerText = `${peaks.length} sommets identifies (Base toponymique & MNT).`;
-        } catch (e) {
-            console.warn("Extraction sommets:", e);
-        }
-        await new Promise(r => setTimeout(r, 80));
-
-        // Villes & Communes
-        stepTitle.innerText = "Toponymie des villes & villages...";
-        stepDetail.innerText = "Interrogation de la base officielle des communes...";
-        progressBar.style.width = '90%';
-        progressCount.innerText = "Etape 4/4 (90%)";
-        let cities = [];
-        try {
-            cities = await fetchCitiesAndVillages(appState.currentBBox, gridW, gridH);
-            stepDetail.innerText = `${cities.length} communes et villes repertoriees.`;
-        } catch (e) {
-            console.warn("Toponymie villes:", e);
-        }
-        await new Promise(r => setTimeout(r, 80));
-
         // Ombrage de relief 3D precalcule
         const hsCanvas = generateHillshadeCanvas(grid, gridW, gridH);
 
@@ -3715,8 +4747,8 @@ async function compileContoursAndEnterStudio() {
         appState.compiledData = {
             mode: 'vector',
             contours,
-            peaks,
-            cities,
+            peaks: [],
+            cities: [],
             contourLabels,
             gridW,
             gridH,
@@ -3728,18 +4760,119 @@ async function compileContoursAndEnterStudio() {
         };
 
         progressBar.style.width = '100%';
-        progressCount.innerText = "Termine !";
-        await new Promise(r => setTimeout(r, 180));
+        progressCount.innerText = "Carte prête";
         modal.classList.remove('show');
+        appState.toponymyReady = false;
+        appState.toponymyLoading = true;
+        appState.toponymyError = null;
 
         // Bascule vers la Page Studio
         enterStudioMode();
+        loadToponymyInBackground(grid, gridW, gridH, minH, maxH);
 
     } catch (err) {
         console.error("Erreur durant la compilation :", err);
         alert(`Une erreur est survenue lors du calcul : ${err.message}`);
         modal.classList.remove('show');
     }
+}
+
+async function loadToponymyInBackground(grid, gridW, gridH, minH, maxH) {
+    const requestId = ++appState.toponymyRequestId;
+    updateToponymyStatus('loading');
+
+    try {
+        const [peaksResult, citiesResult] = await Promise.allSettled([
+            extractMountainPeaks(grid, gridW, gridH, appState.currentBBox, Math.max(40, minH + (maxH - minH) * 0.12)),
+            fetchCitiesAndVillages(appState.currentBBox, gridW, gridH)
+        ]);
+        if (requestId !== appState.toponymyRequestId || !appState.compiledData) return;
+
+        const peaks = peaksResult.status === 'fulfilled' ? peaksResult.value : [];
+        const cities = citiesResult.status === 'fulfilled' ? citiesResult.value : [];
+        if (peaksResult.status === 'rejected') console.warn("Extraction sommets:", peaksResult.reason);
+        if (citiesResult.status === 'rejected') console.warn("Toponymie villes:", citiesResult.reason);
+
+        appState.compiledData.peaks = peaks;
+        appState.compiledData.cities = cities;
+        appState.toponymyReady = true;
+        appState.toponymyLoading = false;
+        updateToponymyStatus('ready', peaks.length, cities.length);
+        renderStudioPreview();
+    } catch (err) {
+        if (requestId !== appState.toponymyRequestId) return;
+        appState.toponymyLoading = false;
+        appState.toponymyError = err;
+        updateToponymyStatus('error');
+    }
+}
+
+async function loadRoadsToponymyInBackground() {
+    const requestId = ++appState.toponymyRequestId;
+
+    // Si des communes et lieux sont déjà extraits des tuiles MVT, le plan est immédiatement prêt pour l'export
+    if (appState.compiledData && appState.compiledData.cities && appState.compiledData.cities.length > 0) {
+        appState.toponymyReady = true;
+        appState.toponymyLoading = false;
+        updateToponymyStatus('ready', 0, appState.compiledData.cities.length);
+        renderStudioPreview();
+    } else {
+        updateToponymyStatus('loading');
+    }
+
+    try {
+        const extraCities = await fetchCitiesAndVillages(appState.currentBBox, 1000, 1000);
+        if (requestId !== appState.toponymyRequestId || !appState.compiledData) return;
+
+        if (!appState.compiledData.cities) appState.compiledData.cities = [];
+        const existingNames = new Set(appState.compiledData.cities.map(c => (c.name || '').toLowerCase()));
+        if (Array.isArray(extraCities)) {
+            for (const c of extraCities) {
+                if (c && c.name && !existingNames.has(c.name.toLowerCase())) {
+                    appState.compiledData.cities.push(c);
+                    existingNames.add(c.name.toLowerCase());
+                }
+            }
+        }
+        appState.toponymyReady = true;
+        appState.toponymyLoading = false;
+        updateToponymyStatus('ready', 0, appState.compiledData.cities.length);
+        renderStudioPreview();
+    } catch (err) {
+        if (requestId !== appState.toponymyRequestId || !appState.compiledData) return;
+        appState.toponymyReady = true;
+        appState.toponymyLoading = false;
+        updateToponymyStatus('ready', 0, (appState.compiledData.cities || []).length);
+        renderStudioPreview();
+    }
+}
+
+function updateToponymyStatus(status, peaksCount = 0, citiesCount = 0) {
+    const statusEl = document.getElementById('studio-toponymy-status');
+    const exportButtons = document.querySelectorAll('[data-requires-toponymy]');
+    if (!statusEl) return;
+    if (status === 'ready' && appState.compiledData) {
+        peaksCount = appState.compiledData.peaks ? appState.compiledData.peaks.length : peaksCount;
+        citiesCount = appState.compiledData.cities ? appState.compiledData.cities.length : citiesCount;
+    }
+
+    const isRoads = appState.compiledData && appState.compiledData.mode === 'roads';
+    statusEl.className = `studio-toponymy-status ${status}`;
+    if (status === 'loading') {
+        statusEl.innerHTML = isRoads
+            ? '<span class="status-dot"></span><span>Recherche des communes et quartiers en arrière-plan…</span>'
+            : '<span class="status-dot"></span><span>Recherche des villes et sommets en arrière-plan…</span>';
+    } else if (status === 'ready') {
+        statusEl.innerHTML = isRoads
+            ? `<span class="status-dot"></span><span>Plan prêt · ${citiesCount} communes & quartiers</span>`
+            : `<span class="status-dot"></span><span>Toponymie prête · ${citiesCount} villes, ${peaksCount} sommets</span>`;
+    } else {
+        statusEl.innerHTML = '<span class="status-dot"></span><span>Toponymie indisponible · export immédiat possible</span>';
+    }
+    exportButtons.forEach(button => {
+        button.disabled = status !== 'ready';
+        button.setAttribute('aria-disabled', status !== 'ready' ? 'true' : 'false');
+    });
 }
 
 function generateContourLabelsData(contours, mapX, mapY, scaleX, scaleY, canvasW) {
@@ -3790,13 +4923,40 @@ function enterStudioMode() {
     document.getElementById('view-map').style.display = 'none';
     document.getElementById('view-studio').style.display = 'flex';
 
-    const isRaster = appState.compiledData && appState.compiledData.mode === 'raster';
+    const mode = appState.compiledData ? appState.compiledData.mode : appState.activeMode;
+    const isRaster = mode === 'raster';
+    const isRoads = mode === 'roads';
+
+    // Affichage des blocs couleurs selon le mode
+    const topoColors = document.getElementById('studio-colors-topo');
+    const roadsColors = document.getElementById('studio-colors-roads');
+    if (topoColors) topoColors.style.display = (isRaster || isRoads) ? 'none' : 'block';
+    if (roadsColors) roadsColors.style.display = isRoads ? 'block' : 'none';
+
+    // Affichage des calques selon le mode
+    const topoToggles = document.getElementById('studio-toggles-topo');
+    const roadsToggles = document.getElementById('studio-toggles-roads');
+    if (topoToggles) topoToggles.style.display = (isRaster || isRoads) ? 'none' : 'block';
+    if (roadsToggles) roadsToggles.style.display = isRoads ? 'block' : 'none';
+
     const strokeRows = document.querySelectorAll('.stroke-slider-row');
-    strokeRows.forEach(el => el.style.display = isRaster ? 'none' : 'flex');
+    strokeRows.forEach(el => {
+        if (isRaster) {
+            el.style.display = 'none';
+        } else if (isRoads) {
+            const inRoads = el.closest('#studio-colors-roads');
+            el.style.display = inRoads ? 'flex' : 'none';
+        } else {
+            const inTopo = el.closest('#studio-colors-topo');
+            el.style.display = inTopo ? 'flex' : 'none';
+        }
+    });
+
     const majorFreqRow = document.getElementById('studio-major-freq-row');
-    if (majorFreqRow) majorFreqRow.style.display = isRaster ? 'none' : 'block';
+    if (majorFreqRow) majorFreqRow.style.display = (!isRaster && !isRoads) ? 'block' : 'none';
 
     syncStudioInputsFromState();
+    updateToponymyStatus(appState.toponymyLoading ? 'loading' : appState.toponymyReady ? 'ready' : 'error');
     renderStudioPreview();
 }
 
@@ -3849,7 +5009,7 @@ function syncStudioInputsFromState() {
         btnLink.title = isLinked ? "Cliquer pour dissocier le fond des lignes de l'affiche" : "Cliquer pour lier et synchroniser les deux fonds";
     }
 
-    // Fond 2 : Fond des lignes (zone carte topo)
+    // Fond 2 : Fond des lignes (zone carte topo / routes)
     const colorMapBg = document.getElementById('color-map-bg');
     const hexMapBg = document.getElementById('hex-map-bg');
     const checkMapBgTrans = document.getElementById('check-map-bg-transparent');
@@ -3863,15 +5023,78 @@ function syncStudioInputsFromState() {
     const colorMajor = document.getElementById('color-major');
     const hexMajor = document.getElementById('hex-major');
     if (colorMajor && hexMajor) {
-        colorMajor.value = colors.majorColor;
-        hexMajor.value = colors.majorColor;
+        const mVal = colors.primary || colors.majorColor || '#E5C158';
+        colorMajor.value = mVal;
+        hexMajor.value = mVal;
     }
 
     const colorMinor = document.getElementById('color-minor');
     const hexMinor = document.getElementById('hex-minor');
     if (colorMinor && hexMinor) {
-        colorMinor.value = colors.minorColor.startsWith('#') ? colors.minorColor : '#a7f3d0';
-        hexMinor.value = colors.minorColor;
+        const minVal = colors.secondary || colors.minorColor || '#A68938';
+        colorMinor.value = minVal.startsWith('#') ? minVal : '#A68938';
+        hexMinor.value = minVal;
+    }
+
+    // Sélecteur unifié Fleuves & Eau dans Couleurs Directes
+    const colorWater = document.getElementById('color-water');
+    const hexWater = document.getElementById('hex-water');
+    const wColorVal = colors.water || colors.waterFillColor || colors.waterColor || '#181F29';
+    if (colorWater && hexWater) {
+        colorWater.value = wColorVal.startsWith('#') ? wColorVal : '#181F29';
+        hexWater.value = wColorVal;
+    }
+
+    // Inputs Couleurs & Sliders pour Routes & Fleuves
+    const cWater = document.getElementById('color-roads-water');
+    const hWater = document.getElementById('hex-roads-water');
+    if (cWater && hWater) {
+        cWater.value = wColorVal.startsWith('#') ? wColorVal : '#181F29';
+        hWater.value = wColorVal;
+    }
+
+    const cWaterBody = document.getElementById('color-roads-waterbody');
+    const hWaterBody = document.getElementById('hex-roads-waterbody');
+    if (cWaterBody && hWaterBody) {
+        cWaterBody.value = wColorVal.startsWith('#') ? wColorVal : '#181F29';
+        hWaterBody.value = wColorVal;
+    }
+
+    const cRoadsMajor = document.getElementById('color-roads-major');
+    const hRoadsMajor = document.getElementById('hex-roads-major');
+    if (cRoadsMajor && hRoadsMajor) {
+        const majVal = colors.primary || colors.roadsMajorColor || '#E5C158';
+        cRoadsMajor.value = majVal;
+        hRoadsMajor.value = majVal;
+    }
+
+    const cRoadsMinor = document.getElementById('color-roads-minor');
+    const hRoadsMinor = document.getElementById('hex-roads-minor');
+    if (cRoadsMinor && hRoadsMinor) {
+        const minVal = colors.secondary || colors.roadsMinorColor || '#A68938';
+        cRoadsMinor.value = minVal.startsWith('#') ? minVal : '#A68938';
+        hRoadsMinor.value = minVal;
+    }
+
+    const sWater = document.getElementById('input-stroke-water');
+    const lWater = document.getElementById('label-stroke-water');
+    if (sWater && lWater) {
+        sWater.value = colors.waterWidth || 2.8;
+        lWater.innerText = `${colors.waterWidth || 2.8}px`;
+    }
+
+    const sRoadsMaj = document.getElementById('input-stroke-roads-major');
+    const lRoadsMaj = document.getElementById('label-stroke-roads-major');
+    if (sRoadsMaj && lRoadsMaj) {
+        sRoadsMaj.value = colors.roadsMajorWidth || 2.0;
+        lRoadsMaj.innerText = `${colors.roadsMajorWidth || 2.0}px`;
+    }
+
+    const sRoadsMin = document.getElementById('input-stroke-roads-minor');
+    const lRoadsMin = document.getElementById('label-stroke-roads-minor');
+    if (sRoadsMin && lRoadsMin) {
+        sRoadsMin.value = colors.roadsMinorWidth || 0.8;
+        lRoadsMin.innerText = `${colors.roadsMinorWidth || 0.8}px`;
     }
 
     const colorCities = document.getElementById('color-cities');
@@ -3943,6 +5166,22 @@ function syncStudioInputsFromState() {
 
     const tPeaks = document.getElementById('studio-toggle-peaks');
     if (tPeaks) tPeaks.checked = appState.showPeaks;
+
+    // Toggles Routes & Fleuves
+    const tWaterways = document.getElementById('studio-toggle-waterways');
+    if (tWaterways) tWaterways.checked = appState.showWaterways !== false;
+
+    const tWaterbodies = document.getElementById('studio-toggle-waterbodies');
+    if (tWaterbodies) tWaterbodies.checked = appState.showWaterBodies !== false;
+
+    const tMotorways = document.getElementById('studio-toggle-motorways');
+    if (tMotorways) tMotorways.checked = appState.showMotorways !== false;
+
+    const tRoadsMajor = document.getElementById('studio-toggle-roads-major');
+    if (tRoadsMajor) tRoadsMajor.checked = appState.showRoadsMajor !== false;
+
+    const tRoadsMinor = document.getElementById('studio-toggle-roads-minor');
+    if (tRoadsMinor) tRoadsMinor.checked = appState.showRoadsMinor !== false;
 
     const tCities = document.getElementById('studio-toggle-cities');
     if (tCities) tCities.checked = appState.showLabels;
@@ -4043,6 +5282,150 @@ function renderStudioPreview(exportResolution = null) {
             ctx.drawImage(data.rasterCanvas, mapX, mapY, mapW, mapH);
             ctx.restore();
         }
+    } else if (data.mode === 'roads') {
+        // --- RENDU MODE ROUTES & FLEUVES (PLAN URBAIN D'ART) ---
+        const previewBaseW = (format.ratio >= 1 ? 1800 : Math.round(1800 * format.ratio));
+        const scaleRatio = canvasW / previewBaseW;
+        const waterColorToUse = colors.water || colors.waterFillColor || colors.waterColor || '#181F29';
+        const primaryColor = colors.primary || colors.roadsMajorColor || '#E5C158';
+        const secondaryColor = colors.secondary || colors.roadsMinorColor || '#A68938';
+
+        // 1. CALQUE WATER (Fleuves & Eau) — au-dessus du fond (bg) et en dessous des rues
+        // Surfaces aquatiques (Fleuves larges, lacs, mers, bassins)
+        if (appState.showWaterBodies && data.waterBodies && data.waterBodies.length > 0) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(mapX, mapY, mapW, mapH);
+            ctx.clip();
+            if (waterColorToUse && waterColorToUse !== 'transparent') {
+                ctx.fillStyle = waterColorToUse;
+                ctx.beginPath();
+                for (const poly of data.waterBodies) {
+                    if (!poly.points || poly.points.length < 3) continue;
+                    ctx.moveTo(mapX + poly.points[0].x * mapW, mapY + poly.points[0].y * mapH);
+                    for (let i = 1; i < poly.points.length; i++) {
+                        ctx.lineTo(mapX + poly.points[i].x * mapW, mapY + poly.points[i].y * mapH);
+                    }
+                    ctx.closePath();
+                }
+                ctx.fill();
+
+                if (colors.waterColor && colors.waterColor !== 'transparent' && colors.waterColor !== waterColorToUse) {
+                    ctx.strokeStyle = colors.waterColor;
+                    ctx.lineWidth = Math.max(0.6, ((colors.waterWidth || 2.4) * 0.4) * scaleRatio);
+                    ctx.lineJoin = 'round';
+                    ctx.stroke();
+                }
+            }
+            ctx.restore();
+        }
+
+        // Cours d'eau linéaires (Affluents, ruisseaux, canaux)
+        if (appState.showWaterways && data.waterways && data.waterways.length > 0) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(mapX, mapY, mapW, mapH);
+            ctx.clip();
+            ctx.strokeStyle = waterColorToUse;
+            ctx.lineWidth = Math.max(0.8, ((colors.waterWidth || 2.4) * 0.85) * scaleRatio);
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.globalAlpha = 0.90;
+            ctx.beginPath();
+            for (const way of data.waterways) {
+                if (!way.points || way.points.length < 2) continue;
+                ctx.moveTo(mapX + way.points[0].x * mapW, mapY + way.points[0].y * mapH);
+                for (let i = 1; i < way.points.length; i++) {
+                    ctx.lineTo(mapX + way.points[i].x * mapW, mapY + way.points[i].y * mapH);
+                }
+            }
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        // 2. RUES SECONDAIRES & LOCALES (secondary) — au-dessus de l'eau
+        if (appState.showRoadsMinor && data.roadsMinor && data.roadsMinor.length > 0) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(mapX, mapY, mapW, mapH);
+            ctx.clip();
+            ctx.strokeStyle = secondaryColor;
+            ctx.lineWidth = Math.max(0.35, ((colors.roadsMinorWidth || 0.8) * 0.75) * scaleRatio);
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.globalAlpha = 0.90;
+            ctx.beginPath();
+            for (const way of data.roadsMinor) {
+                if (!way.points || way.points.length < 2) continue;
+                ctx.moveTo(mapX + way.points[0].x * mapW, mapY + way.points[0].y * mapH);
+                for (let i = 1; i < way.points.length; i++) {
+                    ctx.lineTo(mapX + way.points[i].x * mapW, mapY + way.points[i].y * mapH);
+                }
+            }
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        // 3. ROUTES PRINCIPALES & BOULEVARDS (primary)
+        if (appState.showRoadsMajor && data.roadsMajor && data.roadsMajor.length > 0) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(mapX, mapY, mapW, mapH);
+            ctx.clip();
+            ctx.strokeStyle = primaryColor;
+            ctx.lineWidth = Math.max(1.0, (colors.roadsMajorWidth || 2.0) * scaleRatio);
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.globalAlpha = 0.90;
+            ctx.beginPath();
+            for (const way of data.roadsMajor) {
+                if (!way.points || way.points.length < 2) continue;
+                ctx.moveTo(mapX + way.points[0].x * mapW, mapY + way.points[0].y * mapH);
+                for (let i = 1; i < way.points.length; i++) {
+                    ctx.lineTo(mapX + way.points[i].x * mapW, mapY + way.points[i].y * mapH);
+                }
+            }
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        // 4. AUTOROUTES & VOIES EXPRESS (primary)
+        if (appState.showMotorways && data.motorways && data.motorways.length > 0) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(mapX, mapY, mapW, mapH);
+            ctx.clip();
+            ctx.strokeStyle = primaryColor;
+            ctx.lineWidth = Math.max(1.6, ((colors.roadsMajorWidth || 2.0) * 1.45) * scaleRatio);
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.globalAlpha = 1.0;
+            if (isColorDark(mapBg)) {
+                ctx.shadowColor = primaryColor;
+                ctx.shadowBlur = Math.round(4 * scaleRatio);
+            }
+            ctx.beginPath();
+            for (const way of data.motorways) {
+                if (!way.points || way.points.length < 2) continue;
+                ctx.moveTo(mapX + way.points[0].x * mapW, mapY + way.points[0].y * mapH);
+                for (let i = 1; i < way.points.length; i++) {
+                    ctx.lineTo(mapX + way.points[i].x * mapW, mapY + way.points[i].y * mapH);
+                }
+            }
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        // 6. Communes et quartiers dans le Studio
+        if (appState.showLabels && layout !== 'pure' && data.cities && data.cities.length > 0) {
+            const scaleX = mapW / 1000;
+            const scaleY = mapH / 1000;
+            const themeMock = {
+                textColor: colors.citiesColor || '#ffffff',
+                bg: colors.isTransparent ? 'transparent' : colors.bg
+            };
+            drawCitiesOnCanvas(ctx, data.cities, mapX, mapY, scaleX, scaleY, canvasW, themeMock, mapW, mapH);
+        }
     } else {
         // --- RENDU MODE VECTORIEL (COURBES DEM & TOPONYMIE) ---
         const scaleX = mapW / Math.max(1, data.gridW - 1);
@@ -4077,7 +5460,7 @@ function renderStudioPreview(exportResolution = null) {
             ctx.lineJoin = 'round';
             ctx.strokeStyle = colors.minorColor;
             ctx.lineWidth = Math.max(0.5, (colors.minorWidth !== undefined ? colors.minorWidth : 0.8) * scaleRatio);
-            ctx.globalAlpha = 0.70;
+            ctx.globalAlpha = 0.90;
 
             ctx.beginPath();
             for (const c of data.contours) {
@@ -4213,6 +5596,18 @@ function renderStudioPreview(exportResolution = null) {
     }
 }
 
+async function refreshStudioPreviewForFont() {
+    const renderToken = ++studioFontRenderToken;
+    const fontFamily = appState.fontFamily;
+    await Promise.all([
+        document.fonts.load(`500 32px "${fontFamily}"`),
+        document.fonts.load(`800 32px "${fontFamily}"`)
+    ]);
+    if (renderToken === studioFontRenderToken) {
+        renderStudioPreview();
+    }
+}
+
 function adjustStudioCanvasFit() {
     const stage = document.getElementById('studio-stage');
     const wrapper = document.getElementById('studio-canvas-wrapper');
@@ -4246,6 +5641,10 @@ function adjustStudioCanvasFit() {
 async function exportFromStudio(type = 'png') {
     if (!appState.compiledData) {
         alert("Veuillez d'abord compiler les données de la carte.");
+        return;
+    }
+    if (!appState.toponymyReady) {
+        alert("Veuillez patienter jusqu'à la fin du chargement des villes et sommets avant d'exporter.");
         return;
     }
 
@@ -4390,15 +5789,104 @@ function setupStudioEventListeners() {
     const btnBack = document.getElementById('btn-studio-back');
     if (btnBack) btnBack.addEventListener('click', leaveStudioMode);
 
-    // 2. Palettes prédéfinies en 1 clic
+    // 2. Palettes prédéfinies en 1 clic (12 préréglages exacts)
     const presetPalettes = {
-        emerald: { bg: '#14382c', mapBg: '#14382c', isTransparent: false, isMapTransparent: false, majorColor: '#ffffff', minorColor: '#a7f3d0', citiesColor: '#ffffff', peaksColor: '#ffffff', textColor: '#ffffff' },
-        dark: { bg: '#0f172a', mapBg: '#0f172a', isTransparent: false, isMapTransparent: false, majorColor: '#ffffff', minorColor: '#94a3b8', citiesColor: '#ffffff', peaksColor: '#ffffff', textColor: '#ffffff' },
-        blueprint: { bg: '#0d223a', mapBg: '#0d223a', isTransparent: false, isMapTransparent: false, majorColor: '#e0f2fe', minorColor: '#38bdf8', citiesColor: '#e0f2fe', peaksColor: '#38bdf8', textColor: '#e0f2fe' },
-        sepia: { bg: '#f5eedc', mapBg: '#f5eedc', isTransparent: false, isMapTransparent: false, majorColor: '#3e2723', minorColor: '#8d6e63', citiesColor: '#3e2723', peaksColor: '#3e2723', textColor: '#3e2723' },
-        gold: { bg: '#18181b', mapBg: '#18181b', isTransparent: false, isMapTransparent: false, majorColor: '#fef08a', minorColor: '#ca8a04', citiesColor: '#fef08a', peaksColor: '#fef08a', textColor: '#fef08a' },
-        'mono-light': { bg: '#ffffff', mapBg: '#ffffff', isTransparent: false, isMapTransparent: false, majorColor: '#09090b', minorColor: '#71717a', citiesColor: '#09090b', peaksColor: '#09090b', textColor: '#09090b' },
-        transparent: { bg: 'transparent', mapBg: 'transparent', isTransparent: true, isMapTransparent: true, majorColor: '#ffffff', minorColor: '#ffffff', citiesColor: '#ffffff', peaksColor: '#ffffff', textColor: '#ffffff' }
+        gold: {
+            name: "Noir & Or",
+            bg: "#0B0D10",
+            water: "#181F29",
+            primary: "#E5C158",
+            secondary: "#A68938",
+            text: "#F0D27A"
+        },
+        'gold-white': {
+            name: "Or & Blanc",
+            bg: "#FAF8F5",
+            water: "#E6DFD3",
+            primary: "#9C6D05",
+            secondary: "#BFA36F",
+            text: "#1C1917"
+        },
+        'gold-navy': {
+            name: "Or & Bleu Nuit",
+            bg: "#0A1128",
+            water: "#162547",
+            primary: "#EBC454",
+            secondary: "#9E833C",
+            text: "#F5D87F"
+        },
+        philadelphia: {
+            name: "Philadelphie",
+            bg: "#182232",
+            water: "#263752",
+            primary: "#FFFFFF",
+            secondary: "#8FA3BF",
+            text: "#FFFFFF"
+        },
+        slate: {
+            name: "Ardoise",
+            bg: "#1E2022",
+            water: "#2F343A",
+            primary: "#F1F5F9",
+            secondary: "#848D99",
+            text: "#F8FAFC"
+        },
+        blueprint: {
+            name: "Blueprint",
+            bg: "#0F294A",
+            water: "#1C477D",
+            primary: "#FFFFFF",
+            secondary: "#7FB0EB",
+            text: "#FFFFFF"
+        },
+        minimal: {
+            name: "Minimal",
+            bg: "#FFFFFF",
+            water: "#E2EAF0",
+            primary: "#0F172A",
+            secondary: "#64748B",
+            text: "#0F172A"
+        },
+        sepia: {
+            name: "Sépia",
+            bg: "#F4EFE6",
+            water: "#DFD3BE",
+            primary: "#3E2F26",
+            secondary: "#877360",
+            text: "#2E221B"
+        },
+        emerald: {
+            name: "Émeraude",
+            bg: "#0F2922",
+            water: "#1A4539",
+            primary: "#ECFDF5",
+            secondary: "#74B5A3",
+            text: "#D1FAE5"
+        },
+        terracotta: {
+            name: "Terracotta",
+            bg: "#F7EFEA",
+            water: "#E3CFC3",
+            primary: "#8A2B0E",
+            secondary: "#B57862",
+            text: "#6E220B"
+        },
+        nordic: {
+            name: "Nordique",
+            bg: "#ECEFF4",
+            water: "#D4DCE8",
+            primary: "#242933",
+            secondary: "#6382A6",
+            text: "#242933"
+        },
+        alpha: {
+            name: "Alpha",
+            bg: "transparent",
+            water: "rgba(120, 140, 160, 0.25)",
+            primary: "#0F172A",
+            secondary: "#475569",
+            text: "#0F172A"
+        }
     };
 
     document.querySelectorAll('.palette-chip').forEach(chip => {
@@ -4407,7 +5895,21 @@ function setupStudioEventListeners() {
             chip.classList.add('active');
             const pal = presetPalettes[chip.dataset.palette];
             if (pal) {
-                Object.assign(appState.customColors, pal);
+                const isTrans = pal.bg === 'transparent';
+                appState.customColors.bg = pal.bg;
+                appState.customColors.mapBg = pal.bg;
+                appState.customColors.isTransparent = isTrans;
+                appState.customColors.isMapTransparent = isTrans;
+                appState.customColors.majorColor = pal.primary;
+                appState.customColors.roadsMajorColor = pal.primary;
+                appState.customColors.minorColor = pal.secondary;
+                appState.customColors.roadsMinorColor = pal.secondary;
+                appState.customColors.water = pal.water;
+                appState.customColors.waterColor = pal.water;
+                appState.customColors.waterFillColor = pal.water;
+                appState.customColors.textColor = pal.text;
+                appState.customColors.citiesColor = pal.text;
+                appState.customColors.peaksColor = pal.primary;
                 syncStudioInputsFromState();
                 renderStudioPreview();
             }
@@ -4443,6 +5945,52 @@ function setupStudioEventListeners() {
                 if (cBg) cBg.value = val;
                 if (hBg) hBg.value = val.toUpperCase();
             }
+        } else if (key === 'water') {
+            appState.customColors.water = val;
+            appState.customColors.waterFillColor = val;
+            appState.customColors.waterColor = val;
+            const cWat = document.getElementById('color-water');
+            const hWat = document.getElementById('hex-water');
+            if (cWat && cWat.value !== val) cWat.value = val.startsWith('#') ? val : '#161B22';
+            if (hWat && hWat.value !== val) hWat.value = val;
+            const cWb = document.getElementById('color-roads-waterbody');
+            const hWb = document.getElementById('hex-roads-waterbody');
+            if (cWb) cWb.value = val.startsWith('#') ? val : '#161B22';
+            if (hWb) hWb.value = val;
+            const cW = document.getElementById('color-roads-water');
+            const hW = document.getElementById('hex-roads-water');
+            if (cW) cW.value = val.startsWith('#') ? val : '#161B22';
+            if (hW) hW.value = val;
+        } else if (key === 'waterFillColor' || key === 'waterColor') {
+            appState.customColors.water = val;
+            appState.customColors.waterFillColor = val;
+            appState.customColors.waterColor = val;
+            const cWat = document.getElementById('color-water');
+            const hWat = document.getElementById('hex-water');
+            if (cWat && cWat.value !== val) cWat.value = val.startsWith('#') ? val : '#161B22';
+            if (hWat && hWat.value !== val) hWat.value = val;
+        } else if (key === 'majorColor' || key === 'roadsMajorColor') {
+            appState.customColors.majorColor = val;
+            appState.customColors.roadsMajorColor = val;
+            const cMaj = document.getElementById('color-major');
+            const hMaj = document.getElementById('hex-major');
+            if (cMaj && cMaj.value !== val) cMaj.value = val;
+            if (hMaj && hMaj.value !== val.toUpperCase()) hMaj.value = val.toUpperCase();
+            const cRm = document.getElementById('color-roads-major');
+            const hRm = document.getElementById('hex-roads-major');
+            if (cRm && cRm.value !== val) cRm.value = val;
+            if (hRm && hRm.value !== val.toUpperCase()) hRm.value = val.toUpperCase();
+        } else if (key === 'minorColor' || key === 'roadsMinorColor') {
+            appState.customColors.minorColor = val;
+            appState.customColors.roadsMinorColor = val;
+            const cMin = document.getElementById('color-minor');
+            const hMin = document.getElementById('hex-minor');
+            if (cMin && cMin.value !== val) cMin.value = val;
+            if (hMin && hMin.value !== val.toUpperCase()) hMin.value = val.toUpperCase();
+            const cRmin = document.getElementById('color-roads-minor');
+            const hRmin = document.getElementById('hex-roads-minor');
+            if (cRmin && cRmin.value !== val) cRmin.value = val;
+            if (hRmin && hRmin.value !== val.toUpperCase()) hRmin.value = val.toUpperCase();
         }
         renderStudioPreview();
     }
@@ -4488,8 +6036,13 @@ function setupStudioEventListeners() {
 
     bindColorInput('color-bg', 'hex-bg', 'bg');
     bindColorInput('color-map-bg', 'hex-map-bg', 'mapBg');
+    bindColorInput('color-water', 'hex-water', 'water');
     bindColorInput('color-major', 'hex-major', 'majorColor');
     bindColorInput('color-minor', 'hex-minor', 'minorColor');
+    bindColorInput('color-roads-water', 'hex-roads-water', 'waterColor');
+    bindColorInput('color-roads-waterbody', 'hex-roads-waterbody', 'waterFillColor');
+    bindColorInput('color-roads-major', 'hex-roads-major', 'roadsMajorColor');
+    bindColorInput('color-roads-minor', 'hex-roads-minor', 'roadsMinorColor');
     bindColorInput('color-cities', 'hex-cities', 'citiesColor');
     bindColorInput('color-peaks', 'hex-peaks', 'peaksColor');
     bindColorInput('color-text', 'hex-text', 'textColor');
@@ -4536,7 +6089,7 @@ function setupStudioEventListeners() {
         });
     }
 
-    // Épaisseurs de trait
+    // Épaisseurs de trait Topo
     const strokeMaj = document.getElementById('input-stroke-major');
     const strokeMin = document.getElementById('input-stroke-minor');
     if (strokeMaj) {
@@ -4556,6 +6109,40 @@ function setupStudioEventListeners() {
         });
     }
 
+    // Épaisseurs de trait Routes & Fleuves
+    const strokeWater = document.getElementById('input-stroke-water');
+    const labelWater = document.getElementById('label-stroke-water');
+    if (strokeWater && labelWater) {
+        strokeWater.addEventListener('input', (e) => {
+            const v = parseFloat(e.target.value);
+            appState.customColors.waterWidth = v;
+            labelWater.innerText = `${v}px`;
+            renderStudioPreview();
+        });
+    }
+
+    const strokeRoadsMaj = document.getElementById('input-stroke-roads-major');
+    const labelRoadsMaj = document.getElementById('label-stroke-roads-major');
+    if (strokeRoadsMaj && labelRoadsMaj) {
+        strokeRoadsMaj.addEventListener('input', (e) => {
+            const v = parseFloat(e.target.value);
+            appState.customColors.roadsMajorWidth = v;
+            labelRoadsMaj.innerText = `${v}px`;
+            renderStudioPreview();
+        });
+    }
+
+    const strokeRoadsMin = document.getElementById('input-stroke-roads-minor');
+    const labelRoadsMin = document.getElementById('label-stroke-roads-minor');
+    if (strokeRoadsMin && labelRoadsMin) {
+        strokeRoadsMin.addEventListener('input', (e) => {
+            const v = parseFloat(e.target.value);
+            appState.customColors.roadsMinorWidth = v;
+            labelRoadsMin.innerText = `${v}px`;
+            renderStudioPreview();
+        });
+    }
+
     // Typographie & textes studio
     const studioFont = document.getElementById('studio-select-font');
     if (studioFont) {
@@ -4563,7 +6150,7 @@ function setupStudioEventListeners() {
             appState.fontFamily = e.target.value;
             const mapFont = document.getElementById('select-font');
             if (mapFont) mapFont.value = e.target.value;
-            renderStudioPreview();
+            refreshStudioPreviewForFont();
         });
     }
 
@@ -4621,12 +6208,22 @@ function setupStudioEventListeners() {
             });
         }
     };
+    // Calques studio Topo
     mapToggle('studio-toggle-major', 'showMajorContours');
     mapToggle('studio-toggle-minor', 'showContours');
     mapToggle('studio-toggle-contour-labels', 'showContourLabels');
     mapToggle('studio-toggle-peaks', 'showPeaks');
-    mapToggle('studio-toggle-cities', 'showLabels');
     mapToggle('studio-toggle-hillshade', 'showHillshade');
+
+    // Calques studio Routes & Fleuves
+    mapToggle('studio-toggle-waterways', 'showWaterways');
+    mapToggle('studio-toggle-waterbodies', 'showWaterBodies');
+    mapToggle('studio-toggle-motorways', 'showMotorways');
+    mapToggle('studio-toggle-roads-major', 'showRoadsMajor');
+    mapToggle('studio-toggle-roads-minor', 'showRoadsMinor');
+
+    // Calques communs
+    mapToggle('studio-toggle-cities', 'showLabels');
     mapToggle('studio-toggle-scale', 'showScaleNorth');
 
     // Sélecteur de fréquence des courbes maîtresses dans le Studio
@@ -4729,4 +6326,11 @@ window.addEventListener('DOMContentLoaded', () => {
     initMap();
     setupEventListeners();
     setupStudioEventListeners();
+
+    const requestedPlace = new URLSearchParams(window.location.search).get('ville');
+    if (requestedPlace) {
+        const searchInput = document.getElementById('input-search');
+        if (searchInput) searchInput.value = requestedPlace;
+        window.setTimeout(() => searchLocation(requestedPlace), 250);
+    }
 });

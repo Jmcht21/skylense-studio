@@ -1,4 +1,4 @@
-# topolines.tech — Créateur d'affiches Topographiques personnalisées haute resolution :
+# Topolines — Créateur d'affiches topographiques personnalisées
 
 ## Fonctionnalités du Studio
 
@@ -15,6 +15,20 @@
 - **Pas d'élévation réglable** : 10 m, 20 m, 25 m, 50 m, 100 m, 150 m, 200 m, 250 m, 500 m.
 - **Courbes maîtresses renforcées** : mise en valeur automatique d'un niveau sur cinq avec trait plus épais.
 - **Ombrage 3D du relief (*Hillshade*)** : calcul de pente et d'azimut solaire (315° N-O) pour donner de la profondeur sous les courbes.
+
+### 2. Mode « Routes & Fleuves » (Moteur Vectoriel MVT OpenFreeMap)
+- **100% Client-Side & Quasi-Instantané (< 300 ms)** : télécharge en direct les vraies géométries vectorielles brutes issues des tuiles MVT/PBF d'**OpenFreeMap** via Cloudflare Edge CDN (100% gratuit, sans clé API, compatible CORS).
+- **Décodage MVT en JavaScript Pur** : décode à la volée les couches `transportation`, `water`, `waterway` et `place` du schéma OpenMapTiles via `pbf.js` et un parseur vectoriel natif intégré.
+- **Recherche de villes ultra-rapide via Photon (Komoot)** : géocodage mondial instantané sans limitation agressive.
+- **Hiérarchie urbaine soignée** :
+  - *Hydrographie complète* : polygones de plans d'eau (lacs, bassins, océans, fleuves larges) avec remplissage et contour, et polylignes de cours d'eau (rivières, canaux).
+  - *Axes majeurs & voies express* : autoroutes, périphériques, rocades et tronçons rapides (`motorway`, `trunk`).
+  - *Artères principales* : grands boulevards, avenues, routes nationales et départementales (`primary`, `secondary`, `tertiary`).
+  - *Rues locales & secondaires* : réseau viaire de quartier, rues résidentielles et allées piétonnes (`minor`, `residential`, `living_street`, `service`).
+- **Filtre de densité réglable** : *Intégrale* (toutes rues et venelles), *Standard* (équilibre urbain esthétique), *Épuré* (grands axes et boulevards), *Minimaliste* (voies express uniquement).
+- **Personnalisation chromatique totale** : couleur et épaisseur des fleuves/canaux, couleur de remplissage des lacs, couleur et épaisseur des routes principales et des rues de quartier, fond de carte indépendant ou lié, mode transparent (alpha).
+- **Toponymie urbaine native** : détection et affichage des communes, arrondissements et quartiers directement depuis les tuiles vectorielles.
+- **Exportations vectorielles et haute définition** : SVG vectoriel pur avec `<path>` groupés par calque, PNG jusqu'à 50 Mpx et PDF d'art.
 
 ---
 
@@ -39,9 +53,8 @@ Vous pouvez débloquer des couches HD supplémentaires (Mapbox Satellite, Carto 
 - [x] **Lignes maîtresses renforcées**
 - [x] **Ombrage de relief 3D**
 - [x] **Noms des lieux & sommets (Toponymie)**
-- [x] **Réseau routier & voies de circulation**
 - [x] **Cartouche d'art, échelle & rose des vents**
-- [x] **Mode « Lignes Topo Pures »** : un simple clic masque instantanément tous les textes, routes et cartouches pour ne conserver que la géométrie pure des courbes !
+- [x] **Mode « Lignes Topo Pures »** : un simple clic masque instantanément tous les textes et cartouches pour ne conserver que la géométrie pure des courbes !
 
 ### 3. Formats d'Exportation
 - **Export SVG Vectoriel Pur (.svg)** :
