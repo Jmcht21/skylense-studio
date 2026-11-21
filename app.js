@@ -1,6 +1,6 @@
 /**
  * ==============================================================================
- * TOPOPOSTER STUDIO PRO — MOTEUR APPLICATIF & CARTOGRAPHIQUE
+ * SKYLENSE STUDIO — MOTEUR APPLICATIF & CARTOGRAPHIQUE
  * Architecture Vanilla JS Modulaire, Sans Dépendance Backend
  * ==============================================================================
  */
@@ -270,7 +270,7 @@ const PRESET_PLACES = {
 
 /**
  * ==============================================================================
- * MODULE DE RECHERCHE & CATALOGUE : SOMMETS & VILLES (TOPOPOSTER)
+ * MODULE DE RECHERCHE & CATALOGUE : SOMMETS & VILLES (SKYLENSE STUDIO)
  * ==============================================================================
  */
 
@@ -2100,7 +2100,7 @@ function fetchTile(url, retries = 2) {
                 if (n > 0) {
                     setTimeout(() => attempt(n - 1), 300);
                 } else {
-                    console.warn(`[TopoPoster] Échec chargement tuile: ${url}`);
+                    console.warn(`[Skylense Studio] Échec chargement tuile: ${url}`);
                     resolve(null);
                 }
             };
@@ -2264,7 +2264,7 @@ async function fetchElevationGrid(bbox, targetZoom, sampleSize = 650) {
         }
     }
 
-    console.log(`[TopoPoster] Grille DEM prête : ${gridW}×${gridH} points, de ${Math.round(minH)}m à ${Math.round(maxH)}m`);
+    console.log(`[Skylense Studio] Grille DEM prête : ${gridW}×${gridH} points, de ${Math.round(minH)}m à ${Math.round(maxH)}m`);
     return { grid, gridW, gridH, minH, maxH };
 }
 
@@ -4530,6 +4530,23 @@ function setupEventListeners() {
             if (e.target === apiModal) apiModal.classList.remove('show');
         });
     }
+
+    // Modale des mentions légales et des crédits
+    const legalModal = document.getElementById('legal-modal');
+    const btnOpenLegalModal = document.getElementById('btn-open-legal-modal');
+    const btnCloseLegalModal = document.getElementById('btn-close-legal-modal');
+
+    if (btnOpenLegalModal) {
+        btnOpenLegalModal.addEventListener('click', () => legalModal.classList.add('show'));
+    }
+    if (btnCloseLegalModal) {
+        btnCloseLegalModal.addEventListener('click', () => legalModal.classList.remove('show'));
+    }
+    if (legalModal) {
+        legalModal.addEventListener('click', (e) => {
+            if (e.target === legalModal) legalModal.classList.remove('show');
+        });
+    }
     if (btnSaveApiKeys) {
         btnSaveApiKeys.addEventListener('click', () => {
             if (inputMapbox && inputMapbox.value.trim()) localStorage.setItem('topo_mapbox_token', inputMapbox.value.trim());
@@ -5662,7 +5679,7 @@ async function exportFromStudio(type = 'png') {
 
     await new Promise(r => setTimeout(r, 60));
 
-    const cleanTitle = (appState.titleText || 'topolines')
+    const cleanTitle = (appState.titleText || 'skylense-studio')
         .toLowerCase()
         .normalize('NFD').replace(/[\u0300-\u036f]/g, "")
         .replace(/[^a-z0-9]+/g, '-')
@@ -5702,7 +5719,7 @@ async function exportFromStudio(type = 'png') {
                 appState.fontFamily
             );
             const blob = new Blob([svgData], { type: 'image/svg+xml;charset=utf-8' });
-            downloadBlob(blob, `topolines-${cleanTitle}.svg`);
+            downloadBlob(blob, `skylense-studio-${cleanTitle}.svg`);
         } else {
             let offscreenCanvas;
             if (appState.compiledData.mode === 'raster') {
@@ -5762,12 +5779,12 @@ async function exportFromStudio(type = 'png') {
                 const pdfH = pdf.internal.pageSize.getHeight();
                 const imgData = offscreenCanvas.toDataURL('image/jpeg', 0.96);
                 pdf.addImage(imgData, 'JPEG', 0, 0, pdfW, pdfH);
-                pdf.save(`topolines-${cleanTitle}.pdf`);
+                pdf.save(`skylense-studio-${cleanTitle}.pdf`);
             } else {
                 // PNG Haute Définition
                 offscreenCanvas.toBlob((blob) => {
                     if (blob) {
-                        downloadBlob(blob, `topolines-${cleanTitle}.png`);
+                        downloadBlob(blob, `skylense-studio-${cleanTitle}.png`);
                     }
                 }, 'image/png');
             }

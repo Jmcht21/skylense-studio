@@ -3,15 +3,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Topolines — Créez une affiche topographique gratuite</title>
+    <title>Skylense Studio — Créez une affiche topographique gratuite</title>
     <meta name="description" content="Créez gratuitement une affiche topographique personnalisée à partir de n'importe quelle ville, massif ou sommet. Export PNG, SVG et PDF haute définition.">
     <meta name="keywords" content="affiche topographique, lignes de niveau, carte topographique, poster montagne, carte topo gratuite, isocourbes">
     <meta name="robots" content="index, follow">
-    <link rel="canonical" href="https://topolines.tech/">
+    <link rel="canonical" href="https://studio.skylense.app/">
     <meta property="og:type" content="website">
-    <meta property="og:title" content="Topolines — Créez une affiche topographique gratuite">
+    <meta property="og:title" content="Skylense Studio — Créez une affiche topographique gratuite">
     <meta property="og:description" content="Créez une affiche topographique personnalisée à partir de votre ville, massif ou sommet.">
-    <meta property="og:url" content="https://topolines.tech/">
+    <meta property="og:url" content="https://studio.skylense.app/">
     <meta name="twitter:card" content="summary_large_image">
 
     <!-- Google Fonts : 12 Typographies de prestige -->
@@ -100,7 +100,7 @@
                 <div class="app-brand">
                     <div class="brand-identity">
                         <div class="brand-text">
-                            <h1>Topolines</h1>
+                            <h1>Skylense Studio</h1>
                             <span>Cartographie d'Art & Isocontours</span>
                         </div>
                     </div>
@@ -448,6 +448,7 @@
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
                     <span>Compiler les lignes & Personnaliser</span>
                 </button>
+                <button type="button" class="legal-link" id="btn-open-legal-modal">Mentions légales & crédits</button>
             </div>
         </aside>
 
@@ -468,10 +469,10 @@
             <div class="studio-header-left">
                 <button id="btn-studio-back" class="btn-studio-nav" title="Retourner à la carte pour ajuster le cadrage ou recompiler">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m15 18-6-6 6-6"/></svg>
-                    <span>← Modifier le cadrage (Carte)</span>
+                    <span> Modifier le cadrage (Carte)</span>
                 </button>
                 <div class="studio-brand-inline">
-                    <span class="studio-logo-name">Topolines</span>
+                    <span class="studio-logo-name">Skylense Studio</span>
                     <span class="studio-tag-step">Studio de Création Haute Définition</span>
                 </div>
             </div>
@@ -1022,6 +1023,66 @@
             </div>
         </div>
     </div>
+
+    <!-- Mentions légales et crédits des ressources -->
+    <div id="legal-modal" role="dialog" aria-modal="true" aria-labelledby="legal-modal-title">
+            <div class="legal-modal-card">
+                <div class="api-modal-header">
+                    <div class="api-modal-title" id="legal-modal-title">Mentions légales & crédits</div>
+                    <button class="btn-modal-close" id="btn-close-legal-modal" aria-label="Fermer">&times;</button>
+                </div>
+                <div class="legal-modal-content">
+                    <section>
+                        <h2>Éditeur et hébergement</h2>
+                        <p><strong>Skylense Studio</strong>, accessible à l’adresse <a href="https://studio.skylense.app/">studio.skylense.app</a>.</p>
+                        <p><strong>Éditeur et directeur de la publication :</strong> Jmcht21, créateur du site.</p>
+                        <p><strong>Code source :</strong> <a href="https://github.com/Jmcht21/skylense-studio" target="_blank" rel="noopener noreferrer">dépôt GitHub Jmcht21/skylense-studio</a>. Le dépôt est public ; aucun fichier de licence n’y est actuellement déclaré.</p>
+                        <p><strong>Hébergement :</strong> GitHub Pages, fourni par GitHub, Inc., 88 Colin P. Kelly Jr. Street, San Francisco, CA 94107, États-Unis.</p>
+                        <p><strong>Adresse publique GitHub Pages :</strong> <a href="https://jmcht21.github.io/skylense-studio/" target="_blank" rel="noopener noreferrer">jmcht21.github.io/skylense-studio/</a>.</p>
+                        <p><strong>Domaine :</strong> <code>studio.skylense.app</code>, nom de domaine enregistré auprès de Name.com. GitHub Pages constitue l’hébergement technique du contenu.</p>
+                        <p><strong>Contact :</strong> l’adresse électronique de contact n’est pas encore publiée sur cette page. Elle devra être renseignée avant mise en ligne définitive.</p>
+                    </section>
+                    <section>
+                        <h2>Données, confidentialité et stockage</h2>
+                        <p>L’application génère les affiches dans le navigateur. Les clés API optionnelles saisies dans les réglages sont conservées uniquement dans le localStorage de l’utilisateur ; elles ne sont pas enregistrées par Skylense Studio.</p>
+                        <p>Les recherches de lieux, tuiles cartographiques, modèles d’altitude et données complémentaires sont transmis aux fournisseurs concernés pour fournir le service. Consultez leurs politiques de confidentialité et leurs conditions d’utilisation.</p>
+                    </section>
+                    <section>
+                        <h2>Bibliothèques et polices</h2>
+                        <ul>
+                            <li><a href="https://leafletjs.com/" target="_blank" rel="noopener noreferrer">Leaflet 1.9.4</a> — licence BSD-2-Clause.</li>
+                            <li><a href="https://github.com/parcellabs/pbf" target="_blank" rel="noopener noreferrer">PBF</a> — décodage des tuiles vectorielles.</li>
+                            <li><a href="https://github.com/parallax/jsPDF" target="_blank" rel="noopener noreferrer">jsPDF 2.5.1</a> — licence MIT.</li>
+                            <li><a href="https://fonts.google.com/" target="_blank" rel="noopener noreferrer">Google Fonts</a> — polices distribuées sous licences SIL Open Font License ou compatibles.</li>
+                        </ul>
+                    </section>
+                    <section>
+                        <h2>Cartographie, altitude et lieux</h2>
+                        <ul>
+                            <li><a href="https://www.opentopomap.org/" target="_blank" rel="noopener noreferrer">OpenTopoMap</a> — données <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a>, licence ODbL ; rendu OpenTopoMap.</li>
+                            <li><a href="https://geoservices.ign.fr/" target="_blank" rel="noopener noreferrer">IGN Géoplateforme</a> — cartes, orthophotographies, plan IGN et relief soumis aux conditions IGN.</li>
+                            <li><a href="https://www.openstreetmap.org/" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> — données ODbL, avec attribution « © contributeurs OpenStreetMap ».</li>
+                            <li><a href="https://openfreemap.org/" target="_blank" rel="noopener noreferrer">OpenFreeMap</a> et <a href="https://openmaptiles.org/" target="_blank" rel="noopener noreferrer">OpenMapTiles</a> — tuiles vectorielles basées sur OpenStreetMap.</li>
+                            <li><a href="https://waymarkedtrails.org/" target="_blank" rel="noopener noreferrer">Waymarked Trails</a> — sentiers issus d’OpenStreetMap ; crédits et licence sur le service.</li>
+                            <li><a href="https://reearth-io.github.io/terrain/" target="_blank" rel="noopener noreferrer">Re:Earth Terrain</a> — modèle d’altitude Terrain-RGB.</li>
+                            <li><a href="https://registry.opendata.aws/terrain-tiles/" target="_blank" rel="noopener noreferrer">AWS Terrain Tiles</a> — données Terrarium fournies sur le registre AWS Open Data.</li>
+                            <li><a href="https://photon.komoot.io/" target="_blank" rel="noopener noreferrer">Photon / Komoot</a>, <a href="https://nominatim.org/" target="_blank" rel="noopener noreferrer">Nominatim</a> et <a href="https://overpass-api.de/" target="_blank" rel="noopener noreferrer">Overpass API</a> — recherche géographique fondée sur OpenStreetMap.</li>
+                            <li><a href="https://geo.api.gouv.fr/" target="_blank" rel="noopener noreferrer">API Découpage administratif</a> — données publiées par le gouvernement français.</li>
+                            <li><a href="https://www.geoapify.com/" target="_blank" rel="noopener noreferrer">Geoapify</a>, <a href="https://www.mapbox.com/" target="_blank" rel="noopener noreferrer">Mapbox</a>, <a href="https://stadiamaps.com/" target="_blank" rel="noopener noreferrer">Stadia Maps / Stamen</a> et <a href="https://carto.com/" target="_blank" rel="noopener noreferrer">CARTO</a> — fournisseurs optionnels activés par les clés API de l’utilisateur.</li>
+                            <li><a href="https://www.esri.com/" target="_blank" rel="noopener noreferrer">Esri / ArcGIS</a> — couche optionnelle de limites et lieux mondiaux, selon les conditions Esri.</li>
+                        </ul>
+                    </section>
+                    <section>
+                        <h2>Crédits exportés</h2>
+                        <p>Les affiches peuvent reproduire les données et créations des fournisseurs ci-dessus. L’utilisateur doit conserver les attributions requises et vérifier les conditions de licence avant toute utilisation commerciale ou redistribution.</p>
+                    </section>
+                    <section>
+                        <h2>Responsabilité</h2>
+                        <p>Les données cartographiques et altimétriques sont fournies à titre informatif et de création graphique. Elles ne peuvent pas être utilisées seules comme référence de navigation, sécurité, expertise ou décision professionnelle.</p>
+                    </section>
+                </div>
+            </div>
+        </div>
 
     <!-- Scripts Cartographiques et Logique Applicative -->
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>

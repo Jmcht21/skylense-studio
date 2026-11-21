@@ -1,5 +1,5 @@
 /* ==========================================================================
-   TOPOLINES.TECH — STYLESHEET
+   SKYLENSE STUDIO — STYLESHEET
    Design System Moderne, Minimaliste, Épuré & Haute Définition
    ========================================================================== */
 
@@ -795,6 +795,21 @@ html, body {
     background: var(--bg-panel-solid);
 }
 
+.legal-link {
+    display: block;
+    width: 100%;
+    margin-top: 8px;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 10px;
+    text-align: center;
+    cursor: pointer;
+}
+.legal-link:hover {
+    color: var(--text-secondary);
+}
+
 .btn-compile-primary {
     width: 100%;
     background: var(--btn-primary-bg);
@@ -1470,7 +1485,7 @@ html, body {
 }
 
 /* --- 11. MODALES --- */
-#progress-modal, #api-modal {
+#progress-modal, #api-modal, #legal-modal {
     position: fixed;
     top: 0;
     left: 0;
@@ -1485,7 +1500,7 @@ html, body {
     opacity: 0;
     transition: opacity 0.2s ease;
 }
-#progress-modal.show, #api-modal.show {
+#progress-modal.show, #api-modal.show, #legal-modal.show {
     display: flex;
     opacity: 1;
 }
@@ -1594,6 +1609,49 @@ html, body {
     justify-content: flex-end;
     gap: 10px;
     margin-top: 6px;
+}
+
+.legal-modal-card {
+    background: var(--bg-panel-solid);
+    border: 1px solid var(--border-medium);
+    border-radius: var(--radius-xl);
+    width: 90%;
+    max-width: 720px;
+    max-height: 82vh;
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+}
+.legal-modal-card .api-modal-header {
+    padding: 18px 22px 12px;
+}
+.legal-modal-content {
+    max-height: calc(82vh - 64px);
+    overflow-y: auto;
+    padding: 8px 22px 22px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.55;
+}
+.legal-modal-content section {
+    padding: 8px 0;
+}
+.legal-modal-content h2 {
+    margin: 8px 0 5px;
+    color: var(--text-primary);
+    font-size: 13px;
+}
+.legal-modal-content p {
+    margin: 5px 0;
+}
+.legal-modal-content ul {
+    margin: 5px 0;
+    padding-left: 18px;
+}
+.legal-modal-content li {
+    margin: 4px 0;
+}
+.legal-modal-content a {
+    color: var(--text-accent);
 }
 
 /* --- 12. RESPONSIVE --- */

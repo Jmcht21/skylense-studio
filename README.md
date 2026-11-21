@@ -1,4 +1,4 @@
-# Topolines — Créateur d'affiches topographiques personnalisées
+# Skylense Studio — Créateur d'affiches topographiques personnalisées
 
 ## Fonctionnalités du Studio
 

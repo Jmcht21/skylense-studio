@@ -1,6 +1,6 @@
 /**
  * ==============================================================================
- * TOPOPOSTER STUDIO HD — CONFIGURATION LOCALE DES CLÉS API (OPTIONNEL)
+ * SKYLENSE STUDIO — CONFIGURATION LOCALE DES CLÉS API (OPTIONNEL)
  * ==============================================================================
  * Pour utiliser ce fichier :
  * 1. Copiez ce fichier sous le nom 'config.js' dans ce même dossier.
