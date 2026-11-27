@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+        xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
+  <url>
+    <loc>https://studio.skylense.app/</loc>
+    <lastmod>2026-11-27</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+    <image:image>
+      <image:loc>https://studio.skylense.app/images/topo3.png</image:loc>
+      <image:title>Affiche topographique L'Alpe d'Huez — Skylense Studio</image:title>
+    </image:image>
+    <image:image>
+      <image:loc>https://studio.skylense.app/images/ville.png</image:loc>
+      <image:title>Affiche Routes et Fleuves Grenoble — Skylense Studio</image:title>
+    </image:image>
+    <image:image>
+      <image:loc>https://studio.skylense.app/images/topo1.png</image:loc>
+      <image:title>Affiche topographique La Dent de Crolles — Skylense Studio</image:title>
+    </image:image>
+    <image:image>
+      <image:loc>https://studio.skylense.app/images/topo2.png</image:loc>
+      <image:title>Affiche topographique La Pinéa — Skylense Studio</image:title>
+    </image:image>
+    <image:image>
+      <image:loc>https://studio.skylense.app/images/alpha1.png</image:loc>
+      <image:title>Lignes topographiques sans fond format panorama Alpha — Skylense Studio</image:title>
+    </image:image>
+    <image:image>
+      <image:loc>https://studio.skylense.app/images/alpha16-9.png</image:loc>
+      <image:title>Lignes topographiques format 16:9 Alpha — Skylense Studio</image:title>
+    </image:image>
+    <image:image>
+      <image:loc>https://studio.skylense.app/images/fond.jpg</image:loc>
+      <image:title>Vue aérienne rivière et pont alpin — Skylense Studio</image:title>
+    </image:image>
+  </url>
+  <url>
+    <loc>https://studio.skylense.app/studio.html</loc>
+    <lastmod>2026-11-27</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.9</priority>
+    <image:image>
+      <image:loc>https://studio.skylense.app/images/alpha16-9.png</image:loc>
+      <image:title>Lignes topographiques format 16:9 Alpha — Skylense Studio</image:title>
+    </image:image>
+    <image:image>
+      <image:loc>https://studio.skylense.app/images/fond.jpg</image:loc>
+      <image:title>Vue aérienne rivière et pont alpin — Skylense Studio</image:title>
+    </image:image>
+  </url>
+</urlset>

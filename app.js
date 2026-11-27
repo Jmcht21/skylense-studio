@@ -21,6 +21,7 @@ const TILE_PROVIDERS = {
         url: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
         subdomains: ['a', 'b', 'c'],
         maxZoom: 17,
+        maxNativeZoom: 15,
         attribution: '&copy; OpenTopoMap & MNT'
     },
     ignTop25: {
@@ -722,7 +723,42 @@ async function fetchUrbanVectorTiles(bbox, density = 'standard', options = {}) {
     };
 }
 
-// 0.ter REQUETE OVERPASS DE SECOURS (Multi-miroirs avec Content-Type et repli GET)
+// 0.ter REQUETE OVERPASS RAPIDE EN COURSE PARALLELE (Promise.any sur les 3 miroirs principaux)
+async function queryOverpassFastRace(query, timeoutMs = 2800) {
+    const fastMirrors = [
+        'https://overpass.openstreetmap.fr/api/interpreter',
+        'https://overpass-api.de/api/interpreter',
+        'https://lz4.overpass-api.de/api/interpreter'
+    ];
+    const encodedData = 'data=' + encodeURIComponent(query);
+
+    try {
+        return await Promise.any(fastMirrors.map(async (url) => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+                    body: encodedData,
+                    signal: controller.signal
+                });
+                clearTimeout(timer);
+                if (!res || !res.ok) throw new Error('HTTP ' + (res && res.status));
+                const data = await res.json();
+                if (!data || !Array.isArray(data.elements)) throw new Error('Invalid JSON');
+                return data.elements;
+            } catch (err) {
+                clearTimeout(timer);
+                throw err;
+            }
+        }));
+    } catch (e) {
+        return [];
+    }
+}
+
+// 0.quater REQUETE OVERPASS DE SECOURS (Multi-miroirs avec Content-Type et repli GET)
 async function queryOverpassMirror(query, timeoutMs = 8000) {
     const mirrors = [
         'https://overpass.openstreetmap.fr/api/interpreter',
@@ -1095,7 +1131,7 @@ const KNOWN_SUMMITS_CATALOG = [
     { name: 'Charmant Som', alt: 1867, lat: 45.2972, lng: 5.7647 },
     { name: 'Mont Granier', alt: 1933, lat: 45.4642, lng: 5.9281 },
     { name: 'L\'Aulp du Seuil', alt: 1860, lat: 45.3472, lng: 5.8858 },
-    { name: 'La Pinéa', alt: 1771, lat: 45.2736, lng: 5.7486 },
+    { name: 'La Pinéa', alt: 1771, lat: 45.2889, lng: 5.7383 },
 
     // Belledonne
     { name: 'Grand Pic de Belledonne', alt: 2977, lat: 45.1725, lng: 5.9903 },
@@ -1292,22 +1328,224 @@ const KNOWN_CITIES_CATALOG = [
 ];
 
 // 4. Extraction des sommets (Overpass + Geoapify + Mapbox + Catalogue + Affinage DEM)
+function normalizeToponymName(name) {
+    if (!name) return '';
+    return String(name)
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .replace(/['’`-]/g, ' ')
+        .replace(/^(le|la|les|l)\s+/i, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function projectLatLngToPosterNorm(lat, lng, bbox) {
+    const rad = (v) => Math.max(-85.05112878, Math.min(85.05112878, v)) * Math.PI / 180;
+    const mercY = (v) => (1 - Math.log(Math.tan(rad(v)) + 1 / Math.cos(rad(v))) / Math.PI) / 2;
+    const northY = mercY(bbox.north);
+    const southY = mercY(bbox.south);
+    const normX = (lng - bbox.west) / ((bbox.east - bbox.west) || 1e-9);
+    const normY = (mercY(lat) - northY) / ((southY - northY) || 1e-9);
+    return { x: normX, y: normY };
+}
+
+function deduplicateAndSelectPeaks(candidates, gridW, maxCount = 22) {
+    const radius = Math.max(12, Math.round(gridW * 0.035));
+    const ordered = [...candidates]
+        .filter(p => p && p.isNamed && p.name && !p.name.toUpperCase().startsWith('PT.') && p.name !== 'Sommet')
+        .sort((a, b) => {
+            const pDiff = (b.sourcePriority || 0) - (a.sourcePriority || 0);
+            if (pDiff !== 0) return pDiff;
+            return (b.alt || 0) - (a.alt || 0);
+        });
+
+    // 1. Dédoublonnage strict par nom normalisé et proximité immédiate (la source prioritaire gagne)
+    const uniqueByNameAndPos = [];
+    for (const p of ordered) {
+        const pNorm = normalizeToponymName(p.name);
+        const dup = uniqueByNameAndPos.find(existing => {
+            const eNorm = normalizeToponymName(existing.name);
+            if (pNorm && eNorm && pNorm === eNorm) return true;
+            return haversineDistanceMeters(existing.lat, existing.lng, p.lat, p.lng) < 700;
+        });
+        if (!dup) {
+            uniqueByNameAndPos.push(p);
+        } else if ((p.alt || 0) > (dup.alt || 0) && (p.sourcePriority || 0) >= (dup.sourcePriority || 0)) {
+            dup.alt = p.alt;
+        }
+    }
+
+    // 2. Tri final par altitude décroissante et espacement visuel propre
+    uniqueByNameAndPos.sort((a, b) => (b.alt || 0) - (a.alt || 0));
+    const finalPeaks = [];
+    for (const p of uniqueByNameAndPos) {
+        const tooClose = finalPeaks.some(fp => Math.hypot(fp.gridX - p.gridX, fp.gridY - p.gridY) < radius * 1.15);
+        if (!tooClose && finalPeaks.length < maxCount) {
+            finalPeaks.push(p);
+        }
+    }
+    return finalPeaks;
+}
+
+/**
+ * Extraction ultra-rapide (< 250 ms) des villes et sommets depuis les tuiles vectorielles OpenFreeMap (Cloudflare CDN)
+ */
+async function fetchFastMvtToponymy(bbox, gridW, gridH) {
+    const peaks = [];
+    const cities = [];
+    try {
+        await ensurePbfLoaded();
+        const PbfClass = (typeof Pbf !== 'undefined' ? Pbf : (typeof window !== 'undefined' ? window.Pbf : null));
+        if (!PbfClass) return { peaks, cities };
+
+        const tileUrlTemplate = await getOpenFreeMapTileTemplate();
+        function mercatorY(lat) {
+            const rad = Math.max(-85.0511, Math.min(85.0511, lat)) * Math.PI / 180;
+            return Math.log(Math.tan(Math.PI / 4 + rad / 2));
+        }
+
+        const northNormY = (1 - mercatorY(bbox.north) / Math.PI) / 2;
+        const southNormY = (1 - mercatorY(bbox.south) / Math.PI) / 2;
+        const westNormX = (bbox.west + 180) / 360;
+        const eastNormX = (bbox.east + 180) / 360;
+        const deltaNormX = eastNormX - westNormX;
+        const deltaNormY = southNormY - northNormY;
+
+        const maxSpan = Math.max(bbox.east - bbox.west, bbox.north - bbox.south);
+        let z = 12;
+        if (maxSpan > 0.65) z = 10;
+        else if (maxSpan > 0.24) z = 11;
+
+        const numTiles = Math.pow(2, z);
+        const minTx = Math.max(0, Math.floor(westNormX * numTiles));
+        const maxTx = Math.min(numTiles - 1, Math.floor(eastNormX * numTiles));
+        const minTy = Math.max(0, Math.floor(northNormY * numTiles));
+        const maxTy = Math.min(numTiles - 1, Math.floor(southNormY * numTiles));
+
+        const tileRequests = [];
+        for (let tx = minTx; tx <= maxTx; tx++) {
+            for (let ty = minTy; ty <= maxTy; ty++) {
+                if (tileRequests.length < 9) tileRequests.push({ z, tx, ty });
+            }
+        }
+
+        const buffers = await Promise.all(tileRequests.map(async (t) => {
+            const u = tileUrlTemplate.replace('{z}', t.z).replace('{x}', t.tx).replace('{y}', t.ty);
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 2500);
+            try {
+                const res = await fetch(u, { signal: ctrl.signal });
+                clearTimeout(timer);
+                if (!res.ok) return null;
+                return { ...t, buffer: await res.arrayBuffer() };
+            } catch (e) {
+                clearTimeout(timer);
+                return null;
+            }
+        }));
+
+        for (const t of buffers) {
+            if (!t || !t.buffer || !t.buffer.byteLength) continue;
+            let tile;
+            try {
+                tile = new VectorTile(new PbfClass(new Uint8Array(t.buffer)));
+            } catch (e) { continue; }
+
+            const toNormPt = (p, extent) => {
+                const gx = (t.tx + p.x / extent) / numTiles;
+                const gy = (t.ty + p.y / extent) / numTiles;
+                return {
+                    x: (gx - westNormX) / deltaNormX,
+                    y: (gy - northNormY) / deltaNormY,
+                    ptGx: gx,
+                    ptGy: gy
+                };
+            };
+
+            const placeLayer = tile.layers.place;
+            if (placeLayer) {
+                for (let i = 0; i < placeLayer.length; i++) {
+                    const f = placeLayer.feature(i);
+                    const props = f.properties || {};
+                    const name = props.name || props['name:fr'] || props['name:en'];
+                    if (!name) continue;
+                    const cls = props.class || 'village';
+                    if (cls === 'country' || cls === 'state' || cls === 'province') continue;
+
+                    const geom = f.loadGeometry();
+                    if (!geom || !geom[0] || !geom[0][0]) continue;
+                    const np = toNormPt(geom[0][0], f.extent);
+                    if (np.x < 0.02 || np.x > 0.98 || np.y < 0.02 || np.y > 0.98) continue;
+
+                    const lon = np.ptGx * 360 - 180;
+                    const latRad = Math.PI * (1 - 2 * np.ptGy);
+                    const lat = 180 / Math.PI * (2 * Math.atan(Math.exp(latRad)) - Math.PI / 2);
+                    const pop = props.population || 0;
+                    const score = cls === 'city' ? 4 : (cls === 'town' ? 3 : (pop >= 1500 ? 2 : 1));
+                    cities.push({
+                        gridX: np.x * (gridW - 1),
+                        gridY: np.y * (gridH - 1),
+                        lat,
+                        lng: lon,
+                        name: name.trim(),
+                        type: cls,
+                        score,
+                        population: pop
+                    });
+                }
+            }
+
+            const peakLayer = tile.layers.mountain_peak;
+            if (peakLayer) {
+                for (let i = 0; i < peakLayer.length; i++) {
+                    const f = peakLayer.feature(i);
+                    const props = f.properties || {};
+                    const name = props.name || props['name:fr'] || props['name:en'];
+                    if (!name) continue;
+                    const geom = f.loadGeometry();
+                    if (!geom || !geom[0] || !geom[0][0]) continue;
+                    const np = toNormPt(geom[0][0], f.extent);
+                    if (np.x < 0.02 || np.x > 0.98 || np.y < 0.02 || np.y > 0.98) continue;
+
+                    const lon = np.ptGx * 360 - 180;
+                    const latRad = Math.PI * (1 - 2 * np.ptGy);
+                    const lat = 180 / Math.PI * (2 * Math.atan(Math.exp(latRad)) - Math.PI / 2);
+                    const ele = props.ele ? Math.round(Number(props.ele)) : 0;
+                    peaks.push({
+                        gridX: np.x * (gridW - 1),
+                        gridY: np.y * (gridH - 1),
+                        lat,
+                        lng: lon,
+                        alt: isNaN(ele) ? 0 : ele,
+                        name: name.trim(),
+                        isNamed: true,
+                        sourcePriority: 3
+                    });
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('MVT toponymie rapide:', e);
+    }
+    return { peaks, cities };
+}
+
 async function extractMountainPeaks(grid, gridW, gridH, bbox, minAltitude = 100) {
     const radius = Math.max(12, Math.round(gridW * 0.035));
     const peaks = [];
 
-    function addPeakCandidate(lat, lng, name, altitude, isNamed = true) {
+    function addPeakCandidate(lat, lng, name, altitude, isNamed = true, sourcePriority = 2) {
         if (!name || isNaN(lat) || isNaN(lng)) return;
         const cleanName = name.replace(/^Sommet$/i, '').trim();
         // Exclusion stricte de toute cote anonyme type PT.803M ou Point cote
         if (!cleanName || cleanName.toUpperCase().startsWith('PT.') || cleanName.toUpperCase().startsWith('POINT ') || cleanName.toUpperCase().startsWith('COTE ')) return;
 
-        const normX = (lng - bbox.west) / (bbox.east - bbox.west);
-        const normY = (bbox.north - lat) / (bbox.north - bbox.south);
-        if (normX < 0.02 || normX > 0.98 || normY < 0.02 || normY > 0.98) return;
+        const proj = projectLatLngToPosterNorm(lat, lng, bbox);
+        if (proj.x < 0.02 || proj.x > 0.98 || proj.y < 0.02 || proj.y > 0.98) return;
 
-        const gx = normX * (gridW - 1);
-        const gy = normY * (gridH - 1);
+        const gx = proj.x * (gridW - 1);
+        const gy = proj.y * (gridH - 1);
 
         let alt = altitude;
         if (!alt || isNaN(alt) || alt <= 0) {
@@ -1318,10 +1556,23 @@ async function extractMountainPeaks(grid, gridW, gridH, bbox, minAltitude = 100)
 
         if (alt < minAltitude) return;
 
-        // Deduplication geographique immediate (meme sommet < 1.2km)
-        const dup = peaks.find(p => Math.abs(p.lat - lat) < 0.012 && Math.abs(p.lng - lng) < 0.012);
+        const normName = normalizeToponymName(cleanName);
+        const dup = peaks.find(p =>
+            (normName && normalizeToponymName(p.name) === normName) ||
+            haversineDistanceMeters(p.lat, p.lng, lat, lng) < 700
+        );
         if (dup) {
-            if (alt > dup.alt) dup.alt = alt;
+            if (sourcePriority > (dup.sourcePriority || 0)) {
+                dup.lat = lat;
+                dup.lng = lng;
+                dup.gridX = gx;
+                dup.gridY = gy;
+                dup.name = cleanName;
+                dup.sourcePriority = sourcePriority;
+                if (alt > 0) dup.alt = alt;
+            } else if (alt > dup.alt && sourcePriority >= (dup.sourcePriority || 0)) {
+                dup.alt = alt;
+            }
             return;
         }
 
@@ -1332,36 +1583,36 @@ async function extractMountainPeaks(grid, gridW, gridH, bbox, minAltitude = 100)
             lng,
             alt,
             name: cleanName,
-            isNamed: true
+            isNamed: true,
+            sourcePriority
         });
     }
 
-    // 1. Requetes d'API sans blocage CORS (Overpass mirrors, Geoapify, Mapbox Tilequery, Nominatim)
+    // 1. Requetes d'API sans blocage CORS (Course parallele Overpass rapide + Geoapify + Mapbox)
     try {
-        const overpassPeakQuery = `[out:json][timeout:6];(node["natural"~"peak|volcano"]["name"](${bbox.south.toFixed(4)},${bbox.west.toFixed(4)},${bbox.north.toFixed(4)},${bbox.east.toFixed(4)}););out body 120;`;
+        const overpassPeakQuery = `[out:json][timeout:5];(node["natural"~"peak|volcano"]["name"](${bbox.south.toFixed(4)},${bbox.west.toFixed(4)},${bbox.north.toFixed(4)},${bbox.east.toFixed(4)}););out body 120;`;
         const apiCalls = [
-            queryOverpassMirror(overpassPeakQuery, 3500),
-            fetchPlacesFromGeoapify(bbox, 'natural.mountain', 3500),
-            fetchPlacesFromMapboxTilequery(bbox, 'mountain_peak', 3500),
-            fetchPlacesFromNominatim(bbox, 'peak', 3500)
+            queryOverpassFastRace(overpassPeakQuery, 2800),
+            fetchPlacesFromGeoapify(bbox, 'natural.mountain', 2800),
+            fetchPlacesFromMapboxTilequery(bbox, 'mountain_peak', 2800)
         ];
         const results = await Promise.allSettled(apiCalls);
         
-        // Traitement Overpass
+        // Traitement Overpass (priorite maximale : coordonnees exactes OSM)
         if (results[0].status === 'fulfilled' && Array.isArray(results[0].value)) {
             for (const el of results[0].value) {
                 if (el.tags && el.tags.name) {
                     const alt = el.tags.ele ? parseInt(el.tags.ele, 10) : 0;
-                    addPeakCandidate(el.lat, el.lon, el.tags.name, alt, true);
+                    addPeakCandidate(el.lat, el.lon, el.tags.name, alt, true, 4);
                 }
             }
         }
-        // Traitement Geoapify, Mapbox, Nominatim
+        // Traitement Geoapify & Mapbox
         for (let i = 1; i < results.length; i++) {
             const res = results[i];
             if (res.status === 'fulfilled' && Array.isArray(res.value)) {
                 for (const p of res.value) {
-                    addPeakCandidate(p.lat, p.lng, p.name, p.alt, true);
+                    addPeakCandidate(p.lat, p.lng, p.name, p.alt, true, 2);
                 }
             }
         }
@@ -1369,15 +1620,15 @@ async function extractMountainPeaks(grid, gridW, gridH, bbox, minAltitude = 100)
         console.warn("Requete APIs sommets :", err);
     }
 
-    // 2. Base de sommets remarquables integree (hors ligne, garanti)
+    // 2. Base de sommets remarquables integree (repli uniquement si absent des sources live)
     for (const cat of KNOWN_SUMMITS_CATALOG) {
         if (cat.lat <= bbox.north && cat.lat >= bbox.south &&
             cat.lng >= bbox.west && cat.lng <= bbox.east) {
-            addPeakCandidate(cat.lat, cat.lng, cat.name, cat.alt, true);
+            addPeakCandidate(cat.lat, cat.lng, cat.name, cat.alt, true, 1);
         }
     }
 
-    // 3. Affinage altimetrique sur la matrice DEM (uniquement pour ameliorer les sommets reels connus)
+    // 3. Affinage altimetrique sur la matrice DEM (uniquement pour ameliorer l'altitude, sans deplacer les pics OSM exacts)
     for (let y = radius; y < gridH - radius; y += 4) {
         for (let x = radius; x < gridW - radius; x += 4) {
             const val = grid[y * gridW + x];
@@ -1395,32 +1646,15 @@ async function extractMountainPeaks(grid, gridW, gridH, bbox, minAltitude = 100)
             }
 
             if (isMax) {
-                // Si un sommet nomme est present a proximite, affiner son altitude vers le pic reel du DEM
-                const nearbyNamed = peaks.find(p => Math.hypot(p.gridX - x, p.gridY - y) < radius * 0.9);
+                const nearbyNamed = peaks.find(p => Math.hypot(p.gridX - x, p.gridY - y) < radius * 0.75);
                 if (nearbyNamed && val > nearbyNamed.alt) {
                     nearbyNamed.alt = Math.round(val);
                 }
-                // AUCUN sommet anonyme "Pt. XXX" n'est ajoute
             }
         }
     }
 
-    // 4. Filtrage strict : sommets avec noms reels uniquement
-    const validNamedPeaks = peaks.filter(p => p.isNamed && p.name && !p.name.toUpperCase().startsWith('PT.') && p.name !== 'Sommet');
-
-    // 5. Tri d'excellence par altitude decroissante
-    validNamedPeaks.sort((a, b) => b.alt - a.alt);
-
-    // 6. Deduplication spatiale et selection harmonieuse
-    const finalPeaks = [];
-    for (const p of validNamedPeaks) {
-        const tooClose = finalPeaks.some(fp => Math.hypot(fp.gridX - p.gridX, fp.gridY - p.gridY) < radius * 1.15);
-        if (!tooClose && finalPeaks.length < 22) {
-            finalPeaks.push(p);
-        }
-    }
-
-    return finalPeaks;
+    return deduplicateAndSelectPeaks(peaks, gridW, 22);
 }
 
 // 5. Recherche vectorielle des villes & villages (geo.api.gouv departements + Overpass + Geoapify + Mapbox + Catalogue)
@@ -1432,17 +1666,17 @@ async function fetchCitiesAndVillages(bbox, gridW, gridH) {
         const cleanName = name.trim();
         if (!cleanName) return;
 
-        const normX = (lng - bbox.west) / (bbox.east - bbox.west);
-        const normY = (bbox.north - lat) / (bbox.north - bbox.south);
-        if (normX < 0.02 || normX > 0.98 || normY < 0.02 || normY > 0.98) return;
+        const proj = projectLatLngToPosterNorm(lat, lng, bbox);
+        if (proj.x < 0.02 || proj.x > 0.98 || proj.y < 0.02 || proj.y > 0.98) return;
 
-        const gx = normX * (gridW - 1);
-        const gy = normY * (gridH - 1);
+        const gx = proj.x * (gridW - 1);
+        const gy = proj.y * (gridH - 1);
 
-        // Deduplication geographique immediate (meme nom ou meme endroit < 2km)
-        const existing = rawPlaces.find(c => 
-            (Math.abs(c.lat - lat) < 0.018 && Math.abs(c.lng - lng) < 0.018) ||
-            (c.name.toLowerCase() === cleanName.toLowerCase() && Math.abs(c.lat - lat) < 0.04)
+        // Deduplication geographique & par nom normalise
+        const cNorm = normalizeToponymName(cleanName);
+        const existing = rawPlaces.find(c =>
+            (Math.abs(c.lat - lat) < 0.012 && Math.abs(c.lng - lng) < 0.012) ||
+            (cNorm && normalizeToponymName(c.name) === cNorm && Math.abs(c.lat - lat) < 0.05)
         );
 
         if (existing) {
@@ -1466,66 +1700,58 @@ async function fetchCitiesAndVillages(bbox, gridW, gridH) {
         });
     }
 
-    // 1. En France : Recuperation officielle de toutes les communes des departements intersectes (geo.api.gouv.fr)
+    // 1-3. Execution entierement parallele : geo.api.gouv.fr (France) + Overpass rapide + APIs optionnelles
     const inFrance = (bbox.north <= 51.5 && bbox.south >= 41.0 && bbox.west >= -5.5 && bbox.east <= 10.0);
-    if (inFrance) {
+
+    const fetchFranceCommunesParallel = async () => {
+        if (!inFrance) return;
         try {
             const sampleCoords = [
                 [(bbox.north + bbox.south) / 2, (bbox.west + bbox.east) / 2],
                 [bbox.north * 0.8 + bbox.south * 0.2, bbox.west * 0.8 + bbox.east * 0.2],
-                [bbox.north * 0.2 + bbox.south * 0.8, bbox.west * 0.2 + bbox.east * 0.8],
-                [bbox.north * 0.8 + bbox.south * 0.2, bbox.west * 0.2 + bbox.east * 0.8],
-                [bbox.north * 0.2 + bbox.south * 0.8, bbox.west * 0.8 + bbox.east * 0.2]
+                [bbox.north * 0.2 + bbox.south * 0.8, bbox.west * 0.2 + bbox.east * 0.8]
             ];
             const deptCodes = new Set();
             await Promise.allSettled(sampleCoords.map(async ([lat, lon]) => {
+                const ctrl = new AbortController();
+                const tid = setTimeout(() => ctrl.abort(), 1800);
                 try {
-                    const ctrl = new AbortController();
-                    const tid = setTimeout(() => ctrl.abort(), 2000);
                     const r = await fetch(`https://geo.api.gouv.fr/communes?lat=${lat.toFixed(4)}&lon=${lon.toFixed(4)}&fields=codeDepartement`, { signal: ctrl.signal });
-                    clearTimeout(tid);
                     if (r.ok) {
                         const d = await r.json();
-                        if (Array.isArray(d)) {
-                            for (const it of d) if (it.codeDepartement) deptCodes.add(it.codeDepartement);
-                        }
+                        if (Array.isArray(d)) for (const it of d) if (it.codeDepartement) deptCodes.add(it.codeDepartement);
                     }
-                } catch (e) {}
+                } finally { clearTimeout(tid); }
             }));
 
-            // Interroger la liste complete des communes de chaque departement
-            for (const dept of deptCodes) {
+            await Promise.allSettled([...deptCodes].map(async (dept) => {
+                const ctrl = new AbortController();
+                const tid = setTimeout(() => ctrl.abort(), 2800);
                 try {
-                    const ctrl = new AbortController();
-                    const tid = setTimeout(() => ctrl.abort(), 3500);
                     const res = await fetch(`https://geo.api.gouv.fr/departements/${dept}/communes?fields=nom,centre,population`, { signal: ctrl.signal });
-                    clearTimeout(tid);
-                    if (res.ok) {
-                        const list = await res.json();
-                        if (Array.isArray(list)) {
-                            for (const c of list) {
-                                if (!c.centre || !c.centre.coordinates) continue;
-                                const lon = c.centre.coordinates[0];
-                                const lat = c.centre.coordinates[1];
-                                if (lon < bbox.west || lon > bbox.east || lat < bbox.south || lat > bbox.north) continue;
-                                const pop = c.population || 0;
-                                const placeType = pop >= 25000 ? 'city' : (pop >= 3500 ? 'town' : 'village');
-                                const score = pop >= 50000 ? 4 : (pop >= 15000 ? 3 : (pop >= 3000 ? 2 : 1));
-                                addCityCandidate(lat, lon, c.nom, placeType, pop, score);
-                            }
-                        }
+                    if (!res.ok) return;
+                    const list = await res.json();
+                    if (!Array.isArray(list)) return;
+                    for (const c of list) {
+                        if (!c.centre || !c.centre.coordinates) continue;
+                        const lon = c.centre.coordinates[0];
+                        const lat = c.centre.coordinates[1];
+                        if (lon < bbox.west || lon > bbox.east || lat < bbox.south || lat > bbox.north) continue;
+                        const pop = c.population || 0;
+                        const placeType = pop >= 25000 ? 'city' : (pop >= 3500 ? 'town' : 'village');
+                        const score = pop >= 50000 ? 4 : (pop >= 15000 ? 3 : (pop >= 3000 ? 2 : 1));
+                        addCityCandidate(lat, lon, c.nom, placeType, pop, score);
                     }
-                } catch (e) {}
-            }
+                } finally { clearTimeout(tid); }
+            }));
         } catch (err) {
             console.warn("geo.api.gouv communes:", err);
         }
-    }
+    };
 
-    // 2. Requete OpenStreetMap via les miroirs Overpass fiables (mondial, villes & communes)
-    try {
-        const overpassCities = `[out:json][timeout:6];(node["place"~"city|town|village"]["name"](${bbox.south.toFixed(4)},${bbox.west.toFixed(4)},${bbox.north.toFixed(4)},${bbox.east.toFixed(4)}););out body 150;`;
-        const osmPlaces = await queryOverpassMirror(overpassCities, 3500);
+    const fetchOverpassCitiesFast = async () => {
+        const overpassCities = `[out:json][timeout:5];(node["place"~"city|town|village"]["name"](${bbox.south.toFixed(4)},${bbox.west.toFixed(4)},${bbox.north.toFixed(4)},${bbox.east.toFixed(4)}););out body 150;`;
+        const osmPlaces = await queryOverpassFastRace(overpassCities, 2600);
         if (osmPlaces && Array.isArray(osmPlaces)) {
             for (const el of osmPlaces) {
                 if (el.tags && el.tags.name) {
@@ -1536,17 +1762,13 @@ async function fetchCitiesAndVillages(bbox, gridW, gridH) {
                 }
             }
         }
-    } catch (e) {
-        console.warn("Overpass villes:", e);
-    }
+    };
 
-    // 3. Requetes alternatives (Geoapify, Mapbox Tilequery)
-    try {
-        const apiCalls = [
-            fetchPlacesFromMapboxTilequery(bbox, 'place_label', 3500),
-            fetchPlacesFromGeoapify(bbox, 'populated_place', 3500)
-        ];
-        const results = await Promise.allSettled(apiCalls);
+    const fetchOptionalPlaces = async () => {
+        const results = await Promise.allSettled([
+            fetchPlacesFromMapboxTilequery(bbox, 'place_label', 2500),
+            fetchPlacesFromGeoapify(bbox, 'populated_place', 2500)
+        ]);
         for (const r of results) {
             if (r.status === 'fulfilled' && Array.isArray(r.value)) {
                 for (const item of r.value) {
@@ -1560,9 +1782,13 @@ async function fetchCitiesAndVillages(bbox, gridW, gridH) {
                 }
             }
         }
-    } catch (err) {
-        console.warn("APIs alternatives villes:", err);
-    }
+    };
+
+    await Promise.allSettled([
+        fetchFranceCommunesParallel(),
+        fetchOverpassCitiesFast(),
+        fetchOptionalPlaces()
+    ]);
 
     // 4. Completer avec le catalogue integre des villes et bourgs majeurs
     for (const cat of KNOWN_CITIES_CATALOG) {
@@ -1671,14 +1897,14 @@ const POSTER_THEMES = {
         cardClass: 'theme-sepia'
     },
     gold: {
-        name: 'Noir & Or (Nuit Lumineuse)',
-        bg: '#08090d',
+        name: 'Noir & Or (Champagne Mat)',
+        bg: '#121315',
         isDark: true,
-        minorColor: 'rgba(217, 119, 6, 0.65)',
-        majorColor: '#fde047',
-        peakColor: '#fde047',
-        textColor: '#fde047',
-        subtleLine: 'rgba(253, 224, 71, 0.35)',
+        minorColor: 'rgba(124, 109, 75, 0.72)',
+        majorColor: '#C8AE72',
+        peakColor: '#C8AE72',
+        textColor: '#D4BE8A',
+        subtleLine: 'rgba(200, 174, 114, 0.28)',
         cardClass: 'theme-gold'
     },
     philadelphia: {
@@ -1794,21 +2020,21 @@ const appState = {
 
     // Couleurs personnalisées en direct dans la page studio
     customColors: {
-        bg: '#0B0D10',          // Fond de l'affiche (bords, cartouche, texte)
-        mapBg: '#0B0D10',       // Fond de la carte sous les lignes
+        bg: '#121315',          // Fond de l'affiche (bords, cartouche, texte)
+        mapBg: '#121315',       // Fond de la carte sous les lignes
         linkBgs: true,          // Si true, les deux fonds sont liés
         isTransparent: false,
         isMapTransparent: false,
-        majorColor: '#E5C158',  // Courbes maîtresses (topo) / primary
-        minorColor: '#A68938',  // Courbes secondaires (topo) / secondary
-        roadsMajorColor: '#E5C158', // Grands axes urbains / primary
-        roadsMinorColor: '#A68938', // Rues secondaires / secondary
-        water: '#181F29',       // Couleur des fleuves & plans d'eau
-        waterColor: '#181F29',
-        waterFillColor: '#181F29',
-        citiesColor: '#F0D27A', // Villes
-        peaksColor: '#E5C158',  // Sommets
-        textColor: '#F0D27A',   // Titres & cartouche
+        majorColor: '#C8AE72',  // Courbes maîtresses (topo) / primary
+        minorColor: '#7C6D4B',  // Courbes secondaires (topo) / secondary
+        roadsMajorColor: '#C8AE72', // Grands axes urbains / primary
+        roadsMinorColor: '#7C6D4B', // Rues secondaires / secondary
+        water: '#1C1E22',       // Couleur des fleuves & plans d'eau
+        waterColor: '#1C1E22',
+        waterFillColor: '#1C1E22',
+        citiesColor: '#D4BE8A', // Villes
+        peaksColor: '#C8AE72',  // Sommets
+        textColor: '#D4BE8A',   // Titres & cartouche
         majorWidth: 1.8,
         minorWidth: 0.9,
         roadsMajorWidth: 2.0,
@@ -1826,7 +2052,16 @@ const appState = {
 
     sidebarCollapsed: false,
     currentBBox: null,
-    currentCenter: null
+    currentCenter: null,
+
+    // État Tracé GPX / Strava
+    gpxTrack: null,
+    gpxMapLayer: null,
+    showGpxTrack: true,
+    gpxColor: '#FC4C02',
+    gpxWidth: 3.2,
+    showGpxMarkers: true,
+    showGpxHalo: true
 };
 
 /**
@@ -1843,15 +2078,16 @@ function setUiTheme(theme) {
     document.documentElement.setAttribute('data-ui-theme', theme);
     localStorage.setItem('topo_ui_theme', theme);
 
+    const isLight = theme === 'light';
     const iconDark = document.getElementById('theme-icon-dark');
     const iconLight = document.getElementById('theme-icon-light');
-    if (theme === 'light') {
-        if (iconDark) iconDark.style.display = 'none';
-        if (iconLight) iconLight.style.display = 'block';
-    } else {
-        if (iconDark) iconDark.style.display = 'block';
-        if (iconLight) iconLight.style.display = 'none';
-    }
+    const studioIconDark = document.getElementById('studio-theme-icon-dark');
+    const studioIconLight = document.getElementById('studio-theme-icon-light');
+
+    if (iconDark) iconDark.style.display = isLight ? 'none' : 'block';
+    if (iconLight) iconLight.style.display = isLight ? 'block' : 'none';
+    if (studioIconDark) studioIconDark.style.display = isLight ? 'none' : 'block';
+    if (studioIconLight) studioIconLight.style.display = isLight ? 'block' : 'none';
 }
 
 function toggleUiTheme() {
@@ -1864,6 +2100,41 @@ function toggleUiTheme() {
  * 5. INITIALISATION DE LA CARTE LEAFLET & GESTION DES COUCHES
  * ------------------------------------------------------------------------------
  */
+function centerMapInCropFrame(lat, lng, zoom, animate = true) {
+    if (!appState.map) return;
+    const mapElem = document.getElementById('map');
+    const frameElem = document.getElementById('crop-frame');
+    let offsetX = 0;
+    let offsetY = 0;
+
+    if (mapElem && frameElem) {
+        const mapRect = mapElem.getBoundingClientRect();
+        const frameRect = frameElem.getBoundingClientRect();
+        if (frameRect.width > 0 && frameRect.height > 0 && mapRect.width > 0 && mapRect.height > 0) {
+            const mapCenterX = mapRect.left + mapRect.width / 2;
+            const mapCenterY = mapRect.top + mapRect.height / 2;
+            const frameCenterX = frameRect.left + frameRect.width / 2;
+            const frameCenterY = frameRect.top + frameRect.height / 2;
+            offsetX = frameCenterX - mapCenterX;
+            offsetY = frameCenterY - mapCenterY;
+        }
+    }
+
+    const targetZoom = typeof zoom === 'number' ? zoom : appState.map.getZoom();
+    const targetPt = appState.map.project(L.latLng(lat, lng), targetZoom);
+    const adjustedPt = L.point(targetPt.x - offsetX, targetPt.y - offsetY);
+    const adjustedCenter = appState.map.unproject(adjustedPt, targetZoom);
+
+    if (animate) {
+        appState.map.flyTo(adjustedCenter, targetZoom, {
+            duration: 1.5,
+            easeLinearity: 0.25
+        });
+    } else {
+        appState.map.setView(adjustedCenter, targetZoom, { animate: false });
+    }
+}
+
 function initMap() {
     const initialSpot = PRESET_PLACES.vercors;
 
@@ -1883,6 +2154,7 @@ function initMap() {
     appState.map.on('resize', updateBoundingBox);
 
     updateFrameDimensions();
+    centerMapInCropFrame(initialSpot.coords[0], initialSpot.coords[1], initialSpot.zoom, false);
     updateBoundingBox();
 }
 
@@ -1903,12 +2175,43 @@ function updateInteractiveMapDisplay() {
     }
     const prov = TILE_PROVIDERS[providerKey] || TILE_PROVIDERS.openTopo;
 
-    appState.baseLayer = L.tileLayer(prov.url, {
+    const tileOpts = {
         subdomains: prov.subdomains,
         maxZoom: prov.maxZoom,
-        crossOrigin: 'anonymous',
-        attribution: prov.attribution
-    }).addTo(appState.map);
+        attribution: prov.attribution,
+        keepBuffer: 4
+    };
+    if (prov.maxNativeZoom) {
+        tileOpts.maxNativeZoom = prov.maxNativeZoom;
+    }
+
+    appState.baseLayer = L.tileLayer(prov.url, tileOpts);
+
+    // Réessai automatique avec changement de sous-domaine si une tuile (ex: OpenTopoMap) échoue ou est limitée
+    appState.baseLayer.on('tileerror', (evt) => {
+        const tile = evt && evt.tile;
+        if (!tile) return;
+        const attempt = parseInt(tile.dataset.retryCount || '0', 10);
+        if (attempt >= 3) return;
+        tile.dataset.retryCount = String(attempt + 1);
+
+        const origSrc = tile.dataset.origSrc || tile.src;
+        tile.dataset.origSrc = origSrc;
+
+        let nextSrc = origSrc;
+        if (prov.subdomains && prov.subdomains.length > 1) {
+            const nextSub = prov.subdomains[(attempt + 1) % prov.subdomains.length];
+            nextSrc = origSrc.replace(/\/\/[abc]\.tile\./, `//${nextSub}.tile.`);
+        }
+        const delay = 450 * (attempt + 1) + Math.round(Math.random() * 350);
+        window.setTimeout(() => {
+            if (tile.isConnected) {
+                tile.src = nextSrc;
+            }
+        }, delay);
+    });
+
+    appState.baseLayer.addTo(appState.map);
 
     const mapContainer = document.getElementById('map');
     const tilePane = document.querySelector('.leaflet-tile-pane');
@@ -1963,8 +2266,9 @@ function updateFrameDimensions() {
     const overlayW = overlay.clientWidth;
     const overlayH = overlay.clientHeight;
 
-    const maxFrameW = Math.min(overlayW * 0.82, overlayW - 60);
-    const maxFrameH = Math.min(overlayH * 0.82, overlayH - 60);
+    const pad = overlayW < 560 ? 24 : 60;
+    const maxFrameW = Math.min(overlayW * 0.88, Math.max(80, overlayW - pad));
+    const maxFrameH = Math.min(overlayH * 0.86, Math.max(80, overlayH - pad));
 
     let frameW, frameH;
     const targetRatio = format.ratio;
@@ -2090,23 +2394,29 @@ function updateLivePreview() {
  * 7. MOTEUR DEM & CALCUL DES ISOCONTOURS (512px NATIVE RESOLUTION)
  * ------------------------------------------------------------------------------
  */
-function fetchTile(url, retries = 2) {
+function fetchTile(url, retries = 3) {
     return new Promise((resolve) => {
-        function attempt(n) {
+        function attempt(n, attemptIdx) {
             const img = new Image();
             img.crossOrigin = 'anonymous';
+            let targetUrl = url;
+            if (attemptIdx > 0 && /\/\/[abc]\.tile\.opentopomap\.org/.test(url)) {
+                const subs = ['a', 'b', 'c'];
+                targetUrl = url.replace(/\/\/[abc]\.tile\.opentopomap\.org/, `//${subs[attemptIdx % 3]}.tile.opentopomap.org`);
+            }
             img.onload = () => resolve(img);
             img.onerror = () => {
                 if (n > 0) {
-                    setTimeout(() => attempt(n - 1), 300);
+                    const delay = 400 * (attemptIdx + 1) + Math.round(Math.random() * 300);
+                    setTimeout(() => attempt(n - 1, attemptIdx + 1), delay);
                 } else {
-                    console.warn(`[Skylense Studio] Échec chargement tuile: ${url}`);
+                    console.warn(`[Skylense Studio] Échec chargement tuile: ${targetUrl}`);
                     resolve(null);
                 }
             };
-            img.src = url;
+            img.src = targetUrl;
         }
-        attempt(retries);
+        attempt(retries, 0);
     });
 }
 
@@ -3141,6 +3451,42 @@ function drawContourLabelsOnCanvas(ctx, contours, mapX, mapY, scaleX, scaleY, ca
     return placedLabels;
 }
 
+function computePosterCartoucheHeight(layout, canvasW, canvasH) {
+    if (layout !== 'poster' && layout !== 'poster-fullbleed') return 0;
+    if (canvasH >= canvasW * 0.85) {
+        return Math.round(canvasH * 0.165);
+    }
+    return Math.max(
+        Math.round(canvasH * 0.19),
+        Math.min(Math.round(canvasH * 0.28), Math.round(canvasW * 0.11))
+    );
+}
+
+function measureSpacedTextWidth(ctx, text, letterSpacing) {
+    if (!text) return 0;
+    const chars = Array.from(text);
+    let total = 0;
+    for (let i = 0; i < chars.length; i++) {
+        total += ctx.measureText(chars[i]).width;
+        if (i < chars.length - 1) total += letterSpacing;
+    }
+    return total;
+}
+
+function fitSpacedTextStyle(ctx, text, maxWidth, fontWeight, fontFamily, baseSize, spacingRatio) {
+    let size = Math.max(8, Math.round(baseSize));
+    let spacing = Math.round(size * spacingRatio);
+    ctx.font = `${fontWeight} ${size}px '${fontFamily}', sans-serif`;
+    const measured = measureSpacedTextWidth(ctx, text, spacing);
+    if (measured > maxWidth && measured > 0) {
+        const ratio = maxWidth / measured;
+        size = Math.max(8, Math.floor(size * ratio));
+        spacing = Math.max(0, Math.round(size * spacingRatio * Math.min(1, ratio + 0.15)));
+        ctx.font = `${fontWeight} ${size}px '${fontFamily}', sans-serif`;
+    }
+    return { size, spacing };
+}
+
 /**
  * Dessine le cartouche d'art complet (Mode Affiche d'Art)
  */
@@ -3149,52 +3495,63 @@ function drawPosterArtCartouche(ctx, mapX, mapY, mapW, mapH, marginX, marginY, c
     ctx.lineWidth = Math.max(1, Math.round(canvasW * 0.0008));
     ctx.strokeRect(mapX, mapY, mapW, mapH);
 
-    const cartoucheY = mapY + mapH + Math.round(marginY * 0.4);
-    const cartoucheW = mapW;
+    const cartTop = mapY + mapH;
+    const cartAreaH = Math.max(60, canvasH - cartTop - Math.round(marginY * 0.45));
     const centerX = canvasW / 2;
+    const maxTextW = mapW * 0.92;
 
-    // Titre Principal
-    const typeScale = Math.min(canvasW, canvasH * 1.65);
-    const titleFontSize = Math.round(typeScale * 0.038);
-    ctx.font = `800 ${titleFontSize}px '${appState.fontFamily}', sans-serif`;
+    const mainTitle = (appState.titleText || 'TITRE DE L\'AFFICHE').toUpperCase();
+    const titleFit = fitSpacedTextStyle(
+        ctx, mainTitle, maxTextW, '800', appState.fontFamily,
+        cartAreaH * 0.23, 0.20
+    );
+    const titleY = cartTop + Math.round(cartAreaH * 0.13);
+
     ctx.fillStyle = theme.textColor;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
+    drawSpacedText(ctx, mainTitle, centerX, titleY, titleFit.spacing);
 
-    const mainTitle = (appState.titleText || 'TITRE DE L\'AFFICHE').toUpperCase();
-    drawSpacedText(ctx, mainTitle, centerX, cartoucheY + Math.round(canvasH * 0.015), Math.round(titleFontSize * 0.22));
-
-    // Sous-titre
+    let subBottom = titleY + titleFit.size;
     if (appState.subtitleText) {
-        const subFontSize = Math.round(typeScale * 0.0135);
-        ctx.font = `500 ${subFontSize}px '${appState.fontFamily}', sans-serif`;
+        const subText = appState.subtitleText.toUpperCase();
+        const subFit = fitSpacedTextStyle(
+            ctx, subText, maxTextW, '500', appState.fontFamily,
+            cartAreaH * 0.088, 0.14
+        );
+        const subY = subBottom + Math.round(cartAreaH * 0.065);
         ctx.fillStyle = theme.textColor;
         ctx.globalAlpha = 0.85;
-        const subText = appState.subtitleText.toUpperCase();
-        drawSpacedText(ctx, subText, centerX, cartoucheY + Math.round(canvasH * 0.062), Math.round(subFontSize * 0.16));
+        drawSpacedText(ctx, subText, centerX, subY, subFit.spacing);
         ctx.globalAlpha = 1.0;
+        subBottom = subY + subFit.size;
     }
 
-    // Ligne séparatrice
-    const sepY = cartoucheY + Math.round(canvasH * 0.095);
+    // Ligne séparatrice garantie sous le sous-titre
+    const sepY = Math.max(
+        subBottom + Math.round(cartAreaH * 0.085),
+        cartTop + Math.round(cartAreaH * 0.61)
+    );
     ctx.beginPath();
-    ctx.moveTo(centerX - Math.round(cartoucheW * 0.35), sepY);
-    ctx.lineTo(centerX + Math.round(cartoucheW * 0.35), sepY);
+    ctx.moveTo(centerX - Math.round(mapW * 0.35), sepY);
+    ctx.lineTo(centerX + Math.round(mapW * 0.35), sepY);
     ctx.strokeStyle = theme.subtleLine;
     ctx.lineWidth = Math.max(1, Math.round(canvasW * 0.0006));
     ctx.stroke();
 
     // Coordonnées, Échelle, Nord
-    const metaY = sepY + Math.round(canvasH * 0.022);
-    const metaFontSize = Math.round(typeScale * 0.010);
+    const metaFontSize = Math.max(7, Math.round(cartAreaH * 0.062));
+    const metaY = sepY + Math.round(cartAreaH * 0.135);
     ctx.font = `600 ${metaFontSize}px '${appState.fontFamily}', sans-serif`;
     ctx.fillStyle = theme.textColor;
 
     if (appState.currentCenter) {
         const dms = formatToDMS(appState.currentCenter.lat, appState.currentCenter.lng);
         ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
         ctx.globalAlpha = 0.78;
-        drawSpacedText(ctx, dms, mapX + Math.round(canvasW * 0.01), metaY, Math.round(metaFontSize * 0.08));
+        const dmsFit = fitSpacedTextStyle(ctx, dms, mapW * 0.34, '600', appState.fontFamily, metaFontSize, 0.06);
+        drawSpacedText(ctx, dms, mapX + Math.round(mapW * 0.012), metaY, dmsFit.spacing);
         ctx.globalAlpha = 1.0;
     }
 
@@ -3205,10 +3562,11 @@ function drawPosterArtCartouche(ctx, mapX, mapY, mapW, mapH, marginX, marginY, c
         const totalMeters = pt1.distanceTo(pt2);
         const metersPerPixel = totalMeters / mapW;
 
-        drawGraphicalScaleBar(ctx, centerX, metaY, metersPerPixel, canvasW, theme);
+        drawGraphicalScaleBar(ctx, centerX, metaY, metersPerPixel, canvasW, theme, cartAreaH);
 
-        const northX = mapX + mapW - Math.round(canvasW * 0.025);
-        drawMinimalNorthArrow(ctx, northX, metaY - 2, Math.round(canvasW * 0.022), theme);
+        const northSize = Math.max(10, Math.round(cartAreaH * 0.11));
+        const northX = mapX + mapW - Math.round(mapW * 0.025);
+        drawMinimalNorthArrow(ctx, northX, metaY, northSize, theme);
     }
 }
 
@@ -3216,13 +3574,11 @@ function drawPosterArtCartouche(ctx, mapX, mapY, mapW, mapH, marginX, marginY, c
  * Dessine le cartouche d'art en mode Plein Bord (Lignes 100% jusqu'aux bords)
  */
 function drawPosterFullbleedCartouche(ctx, mapX, mapY, mapW, mapH, cartoucheH, canvasW, canvasH, theme) {
-    // Fond plein du cartouche sous la carte
     if (theme.bg && theme.bg !== 'transparent') {
         ctx.fillStyle = theme.bg;
         ctx.fillRect(0, mapH, canvasW, cartoucheH);
     }
 
-    // Ligne fine séparatrice entre la carte plein bord et le cartouche
     ctx.beginPath();
     ctx.moveTo(0, mapH);
     ctx.lineTo(canvasW, mapH);
@@ -3230,33 +3586,41 @@ function drawPosterFullbleedCartouche(ctx, mapX, mapY, mapW, mapH, cartoucheH, c
     ctx.lineWidth = Math.max(1, Math.round(canvasW * 0.0008));
     ctx.stroke();
 
-    const cartoucheY = mapH + Math.round(canvasH * 0.015);
+    const cartAreaH = Math.max(60, cartoucheH);
     const centerX = canvasW / 2;
+    const maxTextW = canvasW * 0.90;
 
-    // Titre Principal
-    const typeScale = Math.min(canvasW, canvasH * 1.65);
-    const titleFontSize = Math.round(typeScale * 0.038);
-    ctx.font = `800 ${titleFontSize}px '${appState.fontFamily}', sans-serif`;
+    const mainTitle = (appState.titleText || 'TITRE DE L\'AFFICHE').toUpperCase();
+    const titleFit = fitSpacedTextStyle(
+        ctx, mainTitle, maxTextW, '800', appState.fontFamily,
+        cartAreaH * 0.23, 0.20
+    );
+    const titleY = mapH + Math.round(cartAreaH * 0.14);
+
     ctx.fillStyle = theme.textColor;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
+    drawSpacedText(ctx, mainTitle, centerX, titleY, titleFit.spacing);
 
-    const mainTitle = (appState.titleText || 'TITRE DE L\'AFFICHE').toUpperCase();
-    drawSpacedText(ctx, mainTitle, centerX, cartoucheY + Math.round(canvasH * 0.012), Math.round(titleFontSize * 0.22));
-
-    // Sous-titre
+    let subBottom = titleY + titleFit.size;
     if (appState.subtitleText) {
-        const subFontSize = Math.round(typeScale * 0.0135);
-        ctx.font = `500 ${subFontSize}px '${appState.fontFamily}', sans-serif`;
+        const subText = appState.subtitleText.toUpperCase();
+        const subFit = fitSpacedTextStyle(
+            ctx, subText, maxTextW, '500', appState.fontFamily,
+            cartAreaH * 0.088, 0.14
+        );
+        const subY = subBottom + Math.round(cartAreaH * 0.065);
         ctx.fillStyle = theme.textColor;
         ctx.globalAlpha = 0.85;
-        const subText = appState.subtitleText.toUpperCase();
-        drawSpacedText(ctx, subText, centerX, cartoucheY + Math.round(canvasH * 0.058), Math.round(subFontSize * 0.16));
+        drawSpacedText(ctx, subText, centerX, subY, subFit.spacing);
         ctx.globalAlpha = 1.0;
+        subBottom = subY + subFit.size;
     }
 
-    // Ligne séparatrice intérieure
-    const sepY = cartoucheY + Math.round(canvasH * 0.088);
+    const sepY = Math.max(
+        subBottom + Math.round(cartAreaH * 0.085),
+        mapH + Math.round(cartAreaH * 0.60)
+    );
     ctx.beginPath();
     ctx.moveTo(centerX - Math.round(canvasW * 0.35), sepY);
     ctx.lineTo(centerX + Math.round(canvasW * 0.35), sepY);
@@ -3264,9 +3628,8 @@ function drawPosterFullbleedCartouche(ctx, mapX, mapY, mapW, mapH, cartoucheH, c
     ctx.lineWidth = Math.max(1, Math.round(canvasW * 0.0006));
     ctx.stroke();
 
-    // Coordonnées, Échelle, Nord
-    const metaY = sepY + Math.round(canvasH * 0.020);
-    const metaFontSize = Math.round(typeScale * 0.010);
+    const metaFontSize = Math.max(7, Math.round(cartAreaH * 0.062));
+    const metaY = sepY + Math.round(cartAreaH * 0.13);
     ctx.font = `600 ${metaFontSize}px '${appState.fontFamily}', sans-serif`;
     ctx.fillStyle = theme.textColor;
 
@@ -3274,8 +3637,10 @@ function drawPosterFullbleedCartouche(ctx, mapX, mapY, mapW, mapH, cartoucheH, c
     if (center) {
         const dms = formatToDMS(center.lat, center.lng);
         ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
         ctx.globalAlpha = 0.78;
-        drawSpacedText(ctx, dms, Math.round(canvasW * 0.04), metaY, Math.round(metaFontSize * 0.08));
+        const dmsFit = fitSpacedTextStyle(ctx, dms, canvasW * 0.34, '600', appState.fontFamily, metaFontSize, 0.06);
+        drawSpacedText(ctx, dms, Math.round(canvasW * 0.04), metaY, dmsFit.spacing);
         ctx.globalAlpha = 1.0;
     }
 
@@ -3286,10 +3651,11 @@ function drawPosterFullbleedCartouche(ctx, mapX, mapY, mapW, mapH, cartoucheH, c
         const totalMeters = pt1.distanceTo(pt2);
         const metersPerPixel = totalMeters / canvasW;
 
-        drawGraphicalScaleBar(ctx, centerX, metaY, metersPerPixel, canvasW, theme);
+        drawGraphicalScaleBar(ctx, centerX, metaY, metersPerPixel, canvasW, theme, cartAreaH);
 
-        const northX = canvasW - Math.round(canvasW * 0.05);
-        drawMinimalNorthArrow(ctx, northX, metaY - 2, Math.round(canvasW * 0.022), theme);
+        const northSize = Math.max(10, Math.round(cartAreaH * 0.11));
+        const northX = canvasW - Math.round(canvasW * 0.045);
+        drawMinimalNorthArrow(ctx, northX, metaY, northSize, theme);
     }
 }
 
@@ -3297,36 +3663,40 @@ function drawPosterFullbleedCartouche(ctx, mapX, mapY, mapW, mapH, cartoucheH, c
  * Dessine l'habillage sobre et contemporain (Mode Minimal Éditorial)
  */
 function drawMinimalEditorialLayout(ctx, marginX, marginY, canvasW, canvasH, theme) {
-    const bottomY = canvasH - Math.round(marginY * 0.85);
+    const refDim = Math.min(canvasW, canvasH);
+    const padX = Math.max(20, Math.round(canvasW * 0.035));
+    const bottomY = canvasH - Math.max(18, Math.round(canvasH * 0.035));
+    const leftMaxW = canvasW * 0.62;
 
-    // Titre et Sous-titre en bas à gauche
-    const titleFontSize = Math.round(canvasW * 0.022);
-    ctx.font = `800 ${titleFontSize}px '${appState.fontFamily}', sans-serif`;
+    const subText = (appState.subtitleText || '').toUpperCase();
+    const subFit = fitSpacedTextStyle(ctx, subText, leftMaxW, '500', appState.fontFamily, refDim * 0.0135, 0.10);
+
+    const mainTitle = (appState.titleText || '').toUpperCase();
+    const titleFit = fitSpacedTextStyle(ctx, mainTitle, leftMaxW, '800', appState.fontFamily, refDim * 0.030, 0.14);
+    const titleY = subText ? (bottomY - subFit.size - Math.round(refDim * 0.012)) : bottomY;
+
     ctx.fillStyle = theme.textColor;
     ctx.textAlign = 'left';
     ctx.textBaseline = 'bottom';
+    ctx.font = `800 ${titleFit.size}px '${appState.fontFamily}', sans-serif`;
+    drawSpacedText(ctx, mainTitle, padX, titleY, titleFit.spacing);
 
-    const mainTitle = (appState.titleText || '').toUpperCase();
-    drawSpacedText(ctx, mainTitle, marginX, bottomY - Math.round(canvasH * 0.018), Math.round(titleFontSize * 0.16));
-
-    if (appState.subtitleText) {
-        const subFontSize = Math.round(canvasW * 0.0095);
-        ctx.font = `500 ${subFontSize}px '${appState.fontFamily}', sans-serif`;
+    if (subText) {
+        ctx.font = `500 ${subFit.size}px '${appState.fontFamily}', sans-serif`;
         ctx.fillStyle = theme.textColor;
-        ctx.globalAlpha = 0.75;
-        drawSpacedText(ctx, appState.subtitleText.toUpperCase(), marginX, bottomY, Math.round(subFontSize * 0.12));
+        ctx.globalAlpha = 0.78;
+        drawSpacedText(ctx, subText, padX, bottomY, subFit.spacing);
         ctx.globalAlpha = 1.0;
     }
 
-    // Coordonnées GPS et Échelle en bas à droite
     if (appState.currentCenter) {
         const dms = formatToDMS(appState.currentCenter.lat, appState.currentCenter.lng);
-        const metaFontSize = Math.round(canvasW * 0.0095);
-        ctx.font = `600 ${metaFontSize}px '${appState.fontFamily}', sans-serif`;
+        const dmsFit = fitSpacedTextStyle(ctx, dms, canvasW * 0.30, '600', appState.fontFamily, refDim * 0.013, 0.08);
         ctx.fillStyle = theme.textColor;
         ctx.textAlign = 'right';
+        ctx.textBaseline = 'bottom';
         ctx.globalAlpha = 0.78;
-        drawSpacedText(ctx, dms, canvasW - marginX, bottomY, Math.round(metaFontSize * 0.08));
+        drawSpacedText(ctx, dms, canvasW - padX, bottomY, dmsFit.spacing);
         ctx.globalAlpha = 1.0;
     }
 }
@@ -3356,8 +3726,8 @@ function drawSpacedText(ctx, text, x, y, letterSpacing) {
     ctx.textAlign = prevAlign;
 }
 
-function drawGraphicalScaleBar(ctx, centerX, y, metersPerPixel, canvasW, theme) {
-    const targetPixelWidth = canvasW * 0.12;
+function drawGraphicalScaleBar(ctx, centerX, y, metersPerPixel, canvasW, theme, cartAreaH = 0) {
+    const targetPixelWidth = Math.min(canvasW * 0.12, (cartAreaH || canvasW * 0.2) * 0.9);
     const rawMeters = targetPixelWidth * metersPerPixel;
 
     const roundedDistances = [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000];
@@ -3370,6 +3740,8 @@ function drawGraphicalScaleBar(ctx, centerX, y, metersPerPixel, canvasW, theme) 
     const startX = centerX - barPixelWidth / 2;
     const endX = centerX + barPixelWidth / 2;
 
+    const unitSize = cartAreaH > 0 ? cartAreaH : Math.round(canvasW * 0.165);
+
     ctx.save();
     ctx.strokeStyle = theme.textColor;
     ctx.fillStyle = theme.textColor;
@@ -3379,7 +3751,7 @@ function drawGraphicalScaleBar(ctx, centerX, y, metersPerPixel, canvasW, theme) 
     ctx.beginPath();
     ctx.moveTo(startX, y);
     ctx.lineTo(endX, y);
-    const tickH = Math.round(canvasW * 0.0035);
+    const tickH = Math.max(2, Math.round(unitSize * 0.022));
     ctx.moveTo(startX, y - tickH);
     ctx.lineTo(startX, y + tickH);
     ctx.moveTo(endX, y - tickH);
@@ -3387,10 +3759,10 @@ function drawGraphicalScaleBar(ctx, centerX, y, metersPerPixel, canvasW, theme) 
     ctx.stroke();
 
     const label = chosenDistance >= 1000 ? `${chosenDistance / 1000} KM` : `${chosenDistance} M`;
-    ctx.font = `600 ${Math.round(canvasW * 0.0085)}px sans-serif`;
+    ctx.font = `600 ${Math.max(7, Math.round(unitSize * 0.052))}px sans-serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'bottom';
-    ctx.fillText(label, centerX, y - Math.round(canvasW * 0.004));
+    ctx.fillText(label, centerX, y - Math.max(3, Math.round(unitSize * 0.028)));
 
     ctx.restore();
 }
@@ -3479,9 +3851,10 @@ async function renderRasterTilesEngine(ctx, mapX, mapY, mapW, mapH, canvasW) {
     const screenW = screenFrameElem ? screenFrameElem.offsetWidth : 800;
     const screenZoom = appState.map.getZoom();
 
-    const scaleBoost = Math.max(1, mapW / screenW);
+    const scaleBoost = Math.max(1, mapW / Math.max(1, screenW));
     const zoomLevelOffset = Math.round(Math.log2(scaleBoost));
-    let targetZoom = Math.min(provider.maxZoom, screenZoom + zoomLevelOffset);
+    const maxAllowedZoom = provider.maxNativeZoom || provider.maxZoom;
+    let targetZoom = Math.min(maxAllowedZoom, screenZoom + zoomLevelOffset);
     targetZoom = Math.max(2, targetZoom);
 
     const bbox = appState.currentBBox;
@@ -3496,8 +3869,8 @@ async function renderRasterTilesEngine(ctx, mapX, mapY, mapW, mapH, canvasW) {
     const tileList = [];
     for (let tx = minTileX; tx <= maxTileX; tx++) {
         for (let ty = minTileY; ty <= maxTileY; ty++) {
-            const sub = provider.subdomains && provider.subdomains.length > 0 
-                ? provider.subdomains[Math.floor(Math.random() * provider.subdomains.length)] : '';
+            const sub = provider.subdomains && provider.subdomains.length > 0
+                ? provider.subdomains[(tx + ty) % provider.subdomains.length] : '';
             const url = provider.url
                 .replace('{z}', targetZoom)
                 .replace('{x}', tx)
@@ -3507,7 +3880,14 @@ async function renderRasterTilesEngine(ctx, mapX, mapY, mapW, mapH, canvasW) {
         }
     }
 
-    const tiles = await Promise.all(tileList.map(async t => ({ ...t, img: await fetchTile(t.url) })));
+    // Limiter la concurrence sur OpenTopoMap (évite les carrés vides HTTP 429)
+    const batchSize = appState.rasterLayerKey === 'openTopo' ? 4 : 12;
+    const tiles = [];
+    for (let i = 0; i < tileList.length; i += batchSize) {
+        const chunk = tileList.slice(i, i + batchSize);
+        const loaded = await Promise.all(chunk.map(async t => ({ ...t, img: await fetchTile(t.url, 3) })));
+        tiles.push(...loaded);
+    }
 
     ctx.save();
     ctx.beginPath();
@@ -3900,6 +4280,12 @@ function generatePureSVG(vectorData, mapW, mapH, mapX, mapY, canvasW, canvasH, c
         }
     }
 
+    // Calque Tracé GPX / Strava dans le SVG (commun à tous les modes)
+    const svgBBox = (vectorData && vectorData.bbox) || appState.currentBBox;
+    if (appState.gpxTrack && appState.showGpxTrack && svgBBox) {
+        svg += buildGpxSvgLayer(svgBBox, mapW, mapH, canvasW, format, mapBgColor);
+    }
+
     svg += `  </g>\n`;
 
     // Cartouche selon le mode de disposition
@@ -3907,68 +4293,75 @@ function generatePureSVG(vectorData, mapW, mapH, mapX, mapY, canvasW, canvasH, c
     const dms = center ? formatToDMS(center.lat, center.lng) : '';
 
     if (appState.layoutMode === 'poster') {
+        const cH = Math.max(60, canvasH - (mapY + mapH) - Math.round(canvasH * 0.02));
         const centerX = canvasW / 2;
-        const cartY = mapY + mapH + Math.round(canvasH * 0.038);
-        const titleSize = Math.round(canvasW * 0.038);
-        const subSize = Math.round(canvasW * 0.0135);
-        const sepY = cartY + Math.round(canvasH * 0.065);
+        const titleStr = (appState.titleText || '').toUpperCase();
+        const subStr = (appState.subtitleText || '').toUpperCase();
+        const titleSize = Math.round(Math.min(cH * 0.23, (mapW * 0.88) / Math.max(1, titleStr.length * 0.72)));
+        const subSize = Math.round(Math.min(cH * 0.088, (mapW * 0.90) / Math.max(1, subStr.length * 0.65)));
+        const titleY = mapY + mapH + Math.round(cH * 0.14) + titleSize;
+        const subY = titleY + Math.round(cH * 0.07) + subSize;
+        const sepY = Math.max(subY + Math.round(cH * 0.09), mapY + mapH + Math.round(cH * 0.62));
 
-        // Cadre autour de la carte
         svg += `  <rect x="${mapX}" y="${mapY}" width="${mapW}" height="${mapH}" fill="none" stroke="${escapeXmlAttr(textColor)}" stroke-opacity="0.22" stroke-width="1.2"/>\n`;
 
         svg += `  <g id="cartouche-texte" fill="${escapeXmlAttr(textColor)}">\n`;
-        svg += `    <text x="${centerX}" y="${cartY}" font-size="${titleSize}" font-weight="800" text-anchor="middle" letter-spacing="0.22em">${escapeXmlText((appState.titleText || '').toUpperCase())}</text>\n`;
+        svg += `    <text x="${centerX}" y="${titleY}" font-size="${titleSize}" font-weight="800" text-anchor="middle" letter-spacing="0.20em">${escapeXmlText(titleStr)}</text>\n`;
         if (appState.subtitleText) {
-            svg += `    <text x="${centerX}" y="${cartY + Math.round(canvasH * 0.038)}" font-size="${subSize}" font-weight="500" text-anchor="middle" letter-spacing="0.14em" fill-opacity="0.85">${escapeXmlText(appState.subtitleText.toUpperCase())}</text>\n`;
+            svg += `    <text x="${centerX}" y="${subY}" font-size="${subSize}" font-weight="500" text-anchor="middle" letter-spacing="0.14em" fill-opacity="0.85">${escapeXmlText(subStr)}</text>\n`;
         }
         svg += `    <line x1="${centerX - mapW * 0.35}" y1="${sepY}" x2="${centerX + mapW * 0.35}" y2="${sepY}" stroke="${escapeXmlAttr(textColor)}" stroke-opacity="0.25" stroke-width="1.2" />\n`;
 
         if (appState.showScaleNorth) {
-            const metaY = sepY + Math.round(canvasH * 0.024);
-            const metaSize = Math.round(canvasW * 0.0095);
+            const metaSize = Math.max(7, Math.round(cH * 0.062));
+            const metaY = sepY + Math.round(cH * 0.16);
             if (dms) {
-                svg += `    <text x="${mapX + Math.round(canvasW * 0.01)}" y="${metaY}" font-size="${metaSize}" font-weight="600" letter-spacing="0.08em" fill-opacity="0.75">${escapeXmlText(dms)}</text>\n`;
+                svg += `    <text x="${mapX + Math.round(mapW * 0.012)}" y="${metaY}" font-size="${metaSize}" font-weight="600" letter-spacing="0.06em" fill-opacity="0.75">${escapeXmlText(dms)}</text>\n`;
             }
-            svg += `    <text x="${mapX + mapW - Math.round(canvasW * 0.01)}" y="${metaY}" font-size="${metaSize}" font-weight="700" letter-spacing="0.1em" text-anchor="end" fill-opacity="0.85">▲ N</text>\n`;
+            svg += `    <text x="${mapX + mapW - Math.round(mapW * 0.012)}" y="${metaY}" font-size="${metaSize}" font-weight="700" letter-spacing="0.1em" text-anchor="end" fill-opacity="0.85">▲ N</text>\n`;
         }
         svg += `  </g>\n`;
 
     } else if (appState.layoutMode === 'poster-fullbleed') {
+        const cH = Math.max(60, canvasH - mapH);
         const centerX = canvasW / 2;
-        const cartY = mapH + Math.round(canvasH * 0.035);
-        const titleSize = Math.round(canvasW * 0.038);
-        const subSize = Math.round(canvasW * 0.0135);
-        const sepY = cartY + Math.round(canvasH * 0.065);
+        const titleStr = (appState.titleText || '').toUpperCase();
+        const subStr = (appState.subtitleText || '').toUpperCase();
+        const titleSize = Math.round(Math.min(cH * 0.23, (canvasW * 0.88) / Math.max(1, titleStr.length * 0.72)));
+        const subSize = Math.round(Math.min(cH * 0.088, (canvasW * 0.90) / Math.max(1, subStr.length * 0.65)));
+        const titleY = mapH + Math.round(cH * 0.14) + titleSize;
+        const subY = titleY + Math.round(cH * 0.07) + subSize;
+        const sepY = Math.max(subY + Math.round(cH * 0.09), mapH + Math.round(cH * 0.60));
 
-        // Ligne de démarcation fine et nette entre la carte et le cartouche
         svg += `  <line x1="0" y1="${mapH}" x2="${canvasW}" y2="${mapH}" stroke="${escapeXmlAttr(textColor)}" stroke-opacity="0.25" stroke-width="1.2"/>\n`;
 
         svg += `  <g id="cartouche-plein-bord" fill="${escapeXmlAttr(textColor)}">\n`;
-        svg += `    <text x="${centerX}" y="${cartY}" font-size="${titleSize}" font-weight="800" text-anchor="middle" letter-spacing="0.22em">${escapeXmlText((appState.titleText || '').toUpperCase())}</text>\n`;
+        svg += `    <text x="${centerX}" y="${titleY}" font-size="${titleSize}" font-weight="800" text-anchor="middle" letter-spacing="0.20em">${escapeXmlText(titleStr)}</text>\n`;
         if (appState.subtitleText) {
-            svg += `    <text x="${centerX}" y="${cartY + Math.round(canvasH * 0.038)}" font-size="${subSize}" font-weight="500" text-anchor="middle" letter-spacing="0.14em" fill-opacity="0.85">${escapeXmlText(appState.subtitleText.toUpperCase())}</text>\n`;
+            svg += `    <text x="${centerX}" y="${subY}" font-size="${subSize}" font-weight="500" text-anchor="middle" letter-spacing="0.14em" fill-opacity="0.85">${escapeXmlText(subStr)}</text>\n`;
         }
         svg += `    <line x1="${centerX - canvasW * 0.35}" y1="${sepY}" x2="${centerX + canvasW * 0.35}" y2="${sepY}" stroke="${escapeXmlAttr(textColor)}" stroke-opacity="0.25" stroke-width="1.2" />\n`;
 
         if (appState.showScaleNorth) {
-            const metaY = sepY + Math.round(canvasH * 0.024);
-            const metaSize = Math.round(canvasW * 0.0095);
+            const metaSize = Math.max(7, Math.round(cH * 0.062));
+            const metaY = sepY + Math.round(cH * 0.15);
             if (dms) {
-                svg += `    <text x="${Math.round(canvasW * 0.04)}" y="${metaY}" font-size="${metaSize}" font-weight="600" letter-spacing="0.08em" fill-opacity="0.75">${escapeXmlText(dms)}</text>\n`;
+                svg += `    <text x="${Math.round(canvasW * 0.04)}" y="${metaY}" font-size="${metaSize}" font-weight="600" letter-spacing="0.06em" fill-opacity="0.75">${escapeXmlText(dms)}</text>\n`;
             }
             svg += `    <text x="${canvasW - Math.round(canvasW * 0.04)}" y="${metaY}" font-size="${metaSize}" font-weight="700" letter-spacing="0.1em" text-anchor="end" fill-opacity="0.85">▲ N</text>\n`;
         }
         svg += `  </g>\n`;
 
     } else if (appState.layoutMode === 'minimal') {
-        const marginX = Math.round(canvasW * 0.035);
-        const textY = canvasH - Math.round(canvasH * 0.035);
-        const coordsSize = Math.max(9, Math.round(canvasW * 0.009));
-        const subSize = Math.max(9, Math.round(canvasW * 0.0085));
+        const refDim = Math.min(canvasW, canvasH);
+        const marginX = Math.max(20, Math.round(canvasW * 0.035));
+        const textY = canvasH - Math.max(18, Math.round(canvasH * 0.035));
+        const coordsSize = Math.max(9, Math.round(refDim * 0.013));
+        const subSize = Math.max(9, Math.round(refDim * 0.0135));
 
         svg += `  <g id="cartouche-minimal" fill="${escapeXmlAttr(textColor)}">\n`;
         if (dms) {
-            svg += `    <text x="${marginX}" y="${textY}" font-size="${coordsSize}" font-weight="700" letter-spacing="0.12em">${escapeXmlText(dms)}</text>\n`;
+            svg += `    <text x="${marginX}" y="${textY}" font-size="${coordsSize}" font-weight="700" letter-spacing="0.08em">${escapeXmlText(dms)}</text>\n`;
         }
         if (appState.subtitleText) {
             svg += `    <text x="${canvasW - marginX}" y="${textY}" font-size="${subSize}" font-weight="500" letter-spacing="0.08em" text-anchor="end" fill-opacity="0.85">${escapeXmlText(appState.subtitleText.toUpperCase())}</text>\n`;
@@ -4073,10 +4466,7 @@ async function searchLocation(query) {
         }
 
         if (lat !== null && lon !== null) {
-            appState.map.flyTo([lat, lon], 13, {
-                duration: 1.8,
-                easeLinearity: 0.25
-            });
+            centerMapInCropFrame(lat, lon, 13, true);
 
             const inputTitle = document.getElementById('input-title');
             if (inputTitle) inputTitle.value = mainPlace;
@@ -4491,7 +4881,7 @@ function setupEventListeners() {
             if (subtitleInput) subtitleInput.value = spot.subtitle;
             appState.subtitleText = spot.subtitle;
 
-            appState.map.flyTo(spot.coords, spot.zoom, { duration: 1.5 });
+            centerMapInCropFrame(spot.coords[0], spot.coords[1], spot.zoom, true);
             updateLivePreview();
         });
     }
@@ -4626,13 +5016,13 @@ async function compileContoursAndEnterStudio() {
             if (appState.layoutMode === 'poster') {
                 marginX = Math.round(previewW * 0.045);
                 marginY = Math.round(previewH * 0.045);
-                cartoucheH = Math.round(previewH * 0.165);
+                cartoucheH = computePosterCartoucheHeight(appState.layoutMode, previewW, previewH);
                 mapX = marginX;
                 mapY = marginY;
                 mapW = previewW - (marginX * 2);
                 mapH = previewH - (marginY * 2) - cartoucheH;
             } else if (appState.layoutMode === 'poster-fullbleed') {
-                cartoucheH = Math.round(previewH * 0.165);
+                cartoucheH = computePosterCartoucheHeight(appState.layoutMode, previewW, previewH);
                 mapX = 0;
                 mapY = 0;
                 mapW = previewW;
@@ -4796,28 +5186,121 @@ async function compileContoursAndEnterStudio() {
 
 async function loadToponymyInBackground(grid, gridW, gridH, minH, maxH) {
     const requestId = ++appState.toponymyRequestId;
+    const bbox = appState.currentBBox;
+    const minAlt = Math.max(40, minH + (maxH - minH) * 0.12);
     updateToponymyStatus('loading');
 
     try {
+        // Phase 1 quasi-instantanee (< 250 ms) : tuiles MVT OpenFreeMap CDN + catalogues locaux
+        const fastMvt = await fetchFastMvtToponymy(bbox, gridW, gridH);
+        if (requestId !== appState.toponymyRequestId || !appState.compiledData) return;
+
+        const fastPeaks = [...(fastMvt.peaks || [])];
+        for (const cat of KNOWN_SUMMITS_CATALOG) {
+            if (cat.lat <= bbox.north && cat.lat >= bbox.south && cat.lng >= bbox.west && cat.lng <= bbox.east) {
+                const proj = projectLatLngToPosterNorm(cat.lat, cat.lng, bbox);
+                if (proj.x < 0.02 || proj.x > 0.98 || proj.y < 0.02 || proj.y > 0.98) continue;
+                const catNorm = normalizeToponymName(cat.name);
+                if (!fastPeaks.some(p =>
+                    (catNorm && normalizeToponymName(p.name) === catNorm) ||
+                    haversineDistanceMeters(p.lat, p.lng, cat.lat, cat.lng) < 700
+                )) {
+                    fastPeaks.push({
+                        gridX: proj.x * (gridW - 1),
+                        gridY: proj.y * (gridH - 1),
+                        lat: cat.lat,
+                        lng: cat.lng,
+                        alt: cat.alt,
+                        name: cat.name,
+                        isNamed: true,
+                        sourcePriority: 1
+                    });
+                }
+            }
+        }
+        for (const p of fastPeaks) {
+            if (!p.alt || p.alt <= 0) {
+                const ix = Math.min(gridW - 1, Math.max(0, Math.round(p.gridX)));
+                const iy = Math.min(gridH - 1, Math.max(0, Math.round(p.gridY)));
+                p.alt = Math.round(grid[iy * gridW + ix]);
+            }
+        }
+        const filteredFastPeaks = deduplicateAndSelectPeaks(fastPeaks.filter(p => p.alt >= minAlt), gridW, 22);
+
+        const fastCities = [...(fastMvt.cities || [])];
+        for (const cat of KNOWN_CITIES_CATALOG) {
+            if (cat.lat <= bbox.north && cat.lat >= bbox.south && cat.lng >= bbox.west && cat.lng <= bbox.east) {
+                const proj = projectLatLngToPosterNorm(cat.lat, cat.lng, bbox);
+                if (proj.x < 0.02 || proj.x > 0.98 || proj.y < 0.02 || proj.y > 0.98) continue;
+                const catNorm = normalizeToponymName(cat.name);
+                if (!fastCities.some(c => normalizeToponymName(c.name) === catNorm)) {
+                    fastCities.push({
+                        gridX: proj.x * (gridW - 1),
+                        gridY: proj.y * (gridH - 1),
+                        lat: cat.lat,
+                        lng: cat.lng,
+                        name: cat.name,
+                        type: cat.type,
+                        score: cat.type === 'city' ? 4 : (cat.type === 'town' ? 3 : 2),
+                        population: cat.population || 0
+                    });
+                }
+            }
+        }
+
+        fastCities.sort((a, b) => (b.score - a.score) || (b.population - a.population));
+        const spacedFastCities = [];
+        const minCitySpace = Math.max(16, Math.round(gridW * 0.03));
+        for (const fc of fastCities) {
+            const fcNorm = normalizeToponymName(fc.name);
+            if (!spacedFastCities.some(sc =>
+                (fcNorm && normalizeToponymName(sc.name) === fcNorm) ||
+                Math.hypot(sc.gridX - fc.gridX, sc.gridY - fc.gridY) < minCitySpace
+            )) {
+                spacedFastCities.push(fc);
+                if (spacedFastCities.length >= 26) break;
+            }
+        }
+
+        appState.compiledData.peaks = filteredFastPeaks;
+        appState.compiledData.cities = spacedFastCities;
+        appState.toponymyReady = true;
+        appState.toponymyLoading = false;
+        updateToponymyStatus('ready', appState.compiledData.peaks.length, appState.compiledData.cities.length);
+        renderStudioPreview();
+
+        // Phase 2 (enrichissement silencieux en parallele : geo.api.gouv + Overpass rapide)
         const [peaksResult, citiesResult] = await Promise.allSettled([
-            extractMountainPeaks(grid, gridW, gridH, appState.currentBBox, Math.max(40, minH + (maxH - minH) * 0.12)),
-            fetchCitiesAndVillages(appState.currentBBox, gridW, gridH)
+            extractMountainPeaks(grid, gridW, gridH, bbox, minAlt),
+            fetchCitiesAndVillages(bbox, gridW, gridH)
         ]);
         if (requestId !== appState.toponymyRequestId || !appState.compiledData) return;
 
-        const peaks = peaksResult.status === 'fulfilled' ? peaksResult.value : [];
-        const cities = citiesResult.status === 'fulfilled' ? citiesResult.value : [];
-        if (peaksResult.status === 'rejected') console.warn("Extraction sommets:", peaksResult.reason);
-        if (citiesResult.status === 'rejected') console.warn("Toponymie villes:", citiesResult.reason);
+        const extraPeaks = peaksResult.status === 'fulfilled' ? peaksResult.value : [];
+        const extraCities = citiesResult.status === 'fulfilled' ? citiesResult.value : [];
 
-        appState.compiledData.peaks = peaks;
-        appState.compiledData.cities = cities;
-        appState.toponymyReady = true;
-        appState.toponymyLoading = false;
-        updateToponymyStatus('ready', peaks.length, cities.length);
+        // Fusion unifiee avec dedoublonnage par nom normalise + priorite source (OSM > MVT > Catalogue)
+        const combinedPeaks = deduplicateAndSelectPeaks([...extraPeaks, ...filteredFastPeaks], gridW, 22);
+
+        const mergedCities = [...extraCities];
+        const minCityMergeSpace = Math.max(14, Math.round(gridW * 0.025));
+        for (const fc of spacedFastCities) {
+            const fcNorm = normalizeToponymName(fc.name);
+            if (!mergedCities.some(c =>
+                (fcNorm && normalizeToponymName(c.name) === fcNorm) ||
+                Math.hypot(c.gridX - fc.gridX, c.gridY - fc.gridY) < minCityMergeSpace
+            )) {
+                mergedCities.push(fc);
+            }
+        }
+
+        appState.compiledData.peaks = combinedPeaks;
+        appState.compiledData.cities = mergedCities.slice(0, 28);
+        updateToponymyStatus('ready', appState.compiledData.peaks.length, appState.compiledData.cities.length);
         renderStudioPreview();
     } catch (err) {
         if (requestId !== appState.toponymyRequestId) return;
+        appState.toponymyReady = true;
         appState.toponymyLoading = false;
         appState.toponymyError = err;
         updateToponymyStatus('error');
@@ -4958,6 +5441,10 @@ function enterStudioMode() {
 
     const strokeRows = document.querySelectorAll('.stroke-slider-row');
     strokeRows.forEach(el => {
+        if (el.closest('#studio-gpx-group')) {
+            el.style.display = 'flex';
+            return;
+        }
         if (isRaster) {
             el.style.display = 'none';
         } else if (isRoads) {
@@ -4973,6 +5460,7 @@ function enterStudioMode() {
     if (majorFreqRow) majorFreqRow.style.display = (!isRaster && !isRoads) ? 'block' : 'none';
 
     syncStudioInputsFromState();
+    updateGpxUiPanels();
     updateToponymyStatus(appState.toponymyLoading ? 'loading' : appState.toponymyReady ? 'ready' : 'error');
     renderStudioPreview();
 }
@@ -5259,13 +5747,13 @@ function renderStudioPreview(exportResolution = null) {
     if (layout === 'poster') {
         marginX = Math.round(canvasW * 0.045);
         marginY = Math.round(canvasH * 0.045);
-        cartoucheH = Math.round(canvasH * 0.165);
+        cartoucheH = computePosterCartoucheHeight(layout, canvasW, canvasH);
         mapX = marginX;
         mapY = marginY;
         mapW = canvasW - (marginX * 2);
         mapH = canvasH - (marginY * 2) - cartoucheH;
     } else if (layout === 'poster-fullbleed') {
-        cartoucheH = Math.round(canvasH * 0.165);
+        cartoucheH = computePosterCartoucheHeight(layout, canvasW, canvasH);
         mapX = 0;
         mapY = 0;
         mapW = canvasW;
@@ -5583,6 +6071,12 @@ function renderStudioPreview(exportResolution = null) {
         }
     }
 
+    // Tracé GPX / Strava superposé sur la carte (tous modes : Iso Topo, Carte Rando IGN, Routes & Fleuves)
+    const gpxBBox = (data && data.bbox) || appState.currentBBox;
+    if (appState.gpxTrack && appState.showGpxTrack && gpxBBox) {
+        drawGpxTrackOnCanvas(ctx, gpxBBox, mapX, mapY, mapW, mapH, canvasW, format);
+    }
+
     // Cartouche ou Minimal Éditorial ou Plein Bord
     if (layout === 'poster') {
         const themeMock = {
@@ -5697,13 +6191,13 @@ async function exportFromStudio(type = 'png') {
     if (layout === 'poster') {
         marginX = Math.round(canvasW * 0.045);
         marginY = Math.round(canvasH * 0.045);
-        cartoucheH = Math.round(canvasH * 0.165);
+        cartoucheH = computePosterCartoucheHeight(layout, canvasW, canvasH);
         mapX = marginX;
         mapY = marginY;
         mapW = canvasW - (marginX * 2);
         mapH = canvasH - (marginY * 2) - cartoucheH;
     } else if (layout === 'poster-fullbleed') {
-        cartoucheH = Math.round(canvasH * 0.165);
+        cartoucheH = computePosterCartoucheHeight(layout, canvasW, canvasH);
         mapX = 0;
         mapY = 0;
         mapW = canvasW;
@@ -5741,6 +6235,11 @@ async function exportFromStudio(type = 'png') {
                 }
 
                 await renderRasterTilesEngine(oCtx, mapX, mapY, mapW, mapH, canvasW);
+
+                const rasterGpxBBox = (appState.compiledData && appState.compiledData.bbox) || appState.currentBBox;
+                if (appState.gpxTrack && appState.showGpxTrack && rasterGpxBBox) {
+                    drawGpxTrackOnCanvas(oCtx, rasterGpxBBox, mapX, mapY, mapW, mapH, canvasW, format);
+                }
 
                 if (layout === 'poster') {
                     const themeMock = {
@@ -5802,19 +6301,22 @@ async function exportFromStudio(type = 'png') {
 }
 
 function setupStudioEventListeners() {
-    // 1. Bouton Retour Carte
+    // 1. Bouton Retour Carte & Bascule Thème Studio
     const btnBack = document.getElementById('btn-studio-back');
     if (btnBack) btnBack.addEventListener('click', leaveStudioMode);
+
+    const btnStudioTheme = document.getElementById('studio-btn-theme-toggle');
+    if (btnStudioTheme) btnStudioTheme.addEventListener('click', toggleUiTheme);
 
     // 2. Palettes prédéfinies en 1 clic (12 préréglages exacts)
     const presetPalettes = {
         gold: {
             name: "Noir & Or",
-            bg: "#0B0D10",
-            water: "#181F29",
-            primary: "#E5C158",
-            secondary: "#A68938",
-            text: "#F0D27A"
+            bg: "#121315",
+            water: "#1C1E22",
+            primary: "#C8AE72",
+            secondary: "#7C6D4B",
+            text: "#D4BE8A"
         },
         'gold-white': {
             name: "Or & Blanc",
@@ -5859,10 +6361,10 @@ function setupStudioEventListeners() {
         minimal: {
             name: "Minimal",
             bg: "#FFFFFF",
-            water: "#E2EAF0",
-            primary: "#0F172A",
-            secondary: "#64748B",
-            text: "#0F172A"
+            water: "#EAEAEA",
+            primary: "#3A3A3A",
+            secondary: "#9A9A9A",
+            text: "#2E2E2E"
         },
         sepia: {
             name: "Sépia",
@@ -6343,6 +6845,7 @@ window.addEventListener('DOMContentLoaded', () => {
     initMap();
     setupEventListeners();
     setupStudioEventListeners();
+    setupGpxDropAndControls();
 
     const requestedPlace = new URLSearchParams(window.location.search).get('ville');
     if (requestedPlace) {
@@ -6351,3 +6854,578 @@ window.addEventListener('DOMContentLoaded', () => {
         window.setTimeout(() => searchLocation(requestedPlace), 250);
     }
 });
+
+/**
+ * ------------------------------------------------------------------------------
+ * 16. MODULE IMPORT & RENDU GPX / STRAVA
+ * ------------------------------------------------------------------------------
+ */
+function gpxLngToNormX(lng) {
+    return (lng + 180) / 360;
+}
+
+function gpxLatToNormY(lat) {
+    const clamped = Math.max(-85.05112878, Math.min(85.05112878, lat));
+    const rad = clamped * Math.PI / 180;
+    return (1 - Math.log(Math.tan(rad) + 1 / Math.cos(rad)) / Math.PI) / 2;
+}
+
+function projectGpxPoint(lat, lon, bbox) {
+    const westX = gpxLngToNormX(bbox.west);
+    const eastX = gpxLngToNormX(bbox.east);
+    const northY = gpxLatToNormY(bbox.north);
+    const southY = gpxLatToNormY(bbox.south);
+    const dX = eastX - westX || 1e-9;
+    const dY = southY - northY || 1e-9;
+    return {
+        x: (gpxLngToNormX(lon) - westX) / dX,
+        y: (gpxLatToNormY(lat) - northY) / dY
+    };
+}
+
+function parseGpxContent(xmlText, fileName = 'Parcours Strava') {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlText, 'application/xml');
+    if (doc.querySelector('parsererror')) {
+        throw new Error('Fichier GPX invalide ou corrompu.');
+    }
+
+    const segments = [];
+    const trkSegs = doc.querySelectorAll('trkseg');
+    trkSegs.forEach(seg => {
+        const pts = [];
+        seg.querySelectorAll('trkpt').forEach(pt => {
+            const lat = parseFloat(pt.getAttribute('lat'));
+            const lon = parseFloat(pt.getAttribute('lon'));
+            if (!isNaN(lat) && !isNaN(lon)) {
+                const eleNode = pt.querySelector('ele');
+                const ele = eleNode ? parseFloat(eleNode.textContent) : null;
+                pts.push({ lat, lon, ele: isNaN(ele) ? null : ele });
+            }
+        });
+        if (pts.length >= 2) segments.push(pts);
+    });
+
+    if (segments.length === 0) {
+        doc.querySelectorAll('rte').forEach(rte => {
+            const pts = [];
+            rte.querySelectorAll('rtept').forEach(pt => {
+                const lat = parseFloat(pt.getAttribute('lat'));
+                const lon = parseFloat(pt.getAttribute('lon'));
+                if (!isNaN(lat) && !isNaN(lon)) {
+                    const eleNode = pt.querySelector('ele');
+                    const ele = eleNode ? parseFloat(eleNode.textContent) : null;
+                    pts.push({ lat, lon, ele: isNaN(ele) ? null : ele });
+                }
+            });
+            if (pts.length >= 2) segments.push(pts);
+        });
+    }
+
+    if (segments.length === 0) {
+        throw new Error('Aucun tracé GPS (<trkpt> ou <rtept>) trouvé dans ce fichier GPX.');
+    }
+
+    let north = -90, south = 90, east = -180, west = 180;
+    let totalMeters = 0;
+    let elevationGainM = 0;
+    let totalPoints = 0;
+
+    for (const seg of segments) {
+        let lastEle = null;
+        for (let i = 0; i < seg.length; i++) {
+            const p = seg[i];
+            totalPoints++;
+            if (p.lat > north) north = p.lat;
+            if (p.lat < south) south = p.lat;
+            if (p.lon > east) east = p.lon;
+            if (p.lon < west) west = p.lon;
+
+            if (i > 0) {
+                totalMeters += haversineDistanceMeters(seg[i - 1].lat, seg[i - 1].lon, p.lat, p.lon);
+            }
+            if (p.ele !== null) {
+                if (lastEle === null) {
+                    lastEle = p.ele;
+                } else {
+                    const diff = p.ele - lastEle;
+                    if (diff >= 3) {
+                        elevationGainM += diff;
+                        lastEle = p.ele;
+                    } else if (diff <= -3) {
+                        lastEle = p.ele;
+                    }
+                }
+            }
+        }
+    }
+
+    // Allégement doux si trace très dense (> 6000 pts) tout en gardant la géométrie fidèle
+    const maxTotalPts = 6000;
+    const stride = totalPoints > maxTotalPts ? Math.ceil(totalPoints / maxTotalPts) : 1;
+    const renderSegments = stride === 1 ? segments : segments.map(seg => {
+        const out = [];
+        for (let i = 0; i < seg.length; i++) {
+            if (i === 0 || i === seg.length - 1 || i % stride === 0) {
+                out.push(seg[i]);
+            }
+        }
+        return out;
+    });
+
+    const nameEl = doc.querySelector('trk > name') || doc.querySelector('metadata > name') || doc.querySelector('rte > name');
+    const fallbackName = fileName.replace(/\.gpx$/i, '').trim() || 'PARCOURS STRAVA';
+    const trackName = (nameEl && nameEl.textContent.trim()) ? nameEl.textContent.trim() : fallbackName;
+
+    return {
+        name: trackName,
+        segments: renderSegments,
+        bounds: { north, south, east, west },
+        distanceKm: totalMeters / 1000,
+        elevationGainM: Math.round(elevationGainM),
+        pointCount: totalPoints
+    };
+}
+
+function renderGpxOnLeafletMap() {
+    if (!appState.map) return;
+    if (appState.gpxMapLayer) {
+        appState.map.removeLayer(appState.gpxMapLayer);
+        appState.gpxMapLayer = null;
+    }
+    if (!appState.gpxTrack) return;
+
+    const group = L.featureGroup();
+    const color = appState.gpxColor || '#FC4C02';
+
+    for (const seg of appState.gpxTrack.segments) {
+        const latlngs = seg.map(p => [p.lat, p.lon]);
+        L.polyline(latlngs, { color: '#000000', weight: 6, opacity: 0.45, lineCap: 'round', lineJoin: 'round' }).addTo(group);
+        L.polyline(latlngs, { color, weight: 3.5, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }).addTo(group);
+    }
+
+    const firstSeg = appState.gpxTrack.segments[0];
+    const lastSeg = appState.gpxTrack.segments[appState.gpxTrack.segments.length - 1];
+    if (firstSeg && firstSeg.length > 0) {
+        const start = firstSeg[0];
+        L.circleMarker([start.lat, start.lon], { radius: 6, color: '#ffffff', weight: 2, fillColor: '#22c55e', fillOpacity: 1 }).addTo(group);
+    }
+    if (lastSeg && lastSeg.length > 0) {
+        const end = lastSeg[lastSeg.length - 1];
+        L.circleMarker([end.lat, end.lon], { radius: 6, color: '#ffffff', weight: 2, fillColor: color, fillOpacity: 1 }).addTo(group);
+    }
+
+    group.addTo(appState.map);
+    appState.gpxMapLayer = group;
+}
+
+function fitMapToGpxTrack() {
+    if (!appState.map || !appState.gpxTrack) return;
+    const b = appState.gpxTrack.bounds;
+    const bounds = L.latLngBounds([b.south, b.west], [b.north, b.east]);
+    const mapElem = document.getElementById('map');
+    const frameElem = document.getElementById('crop-frame');
+    let padTL = [64, 64];
+    let padBR = [64, 64];
+    if (mapElem && frameElem) {
+        const mRect = mapElem.getBoundingClientRect();
+        const fRect = frameElem.getBoundingClientRect();
+        if (fRect.width > 0 && fRect.height > 0) {
+            padTL = [
+                Math.max(24, Math.round(fRect.left - mRect.left + 28)),
+                Math.max(24, Math.round(fRect.top - mRect.top + 28))
+            ];
+            padBR = [
+                Math.max(24, Math.round(mRect.right - fRect.right + 28)),
+                Math.max(24, Math.round(mRect.bottom - fRect.bottom + 28))
+            ];
+        }
+    }
+    appState.map.fitBounds(bounds, {
+        paddingTopLeft: padTL,
+        paddingBottomRight: padBR,
+        maxZoom: 15,
+        animate: true
+    });
+}
+
+function doesGpxIntersectBBox(track, bbox) {
+    if (!track || !bbox) return true;
+    const b = track.bounds;
+    return !(b.east < bbox.west || b.west > bbox.east || b.north < bbox.south || b.south > bbox.north);
+}
+
+function updateGpxUiPanels() {
+    const track = appState.gpxTrack;
+    const mapUploadBtn = document.getElementById('gpx-upload-btn');
+    const mapStats = document.getElementById('gpx-map-stats');
+    const mapName = document.getElementById('gpx-track-name');
+    const mapDist = document.getElementById('gpx-metric-dist');
+    const mapElev = document.getElementById('gpx-metric-elev');
+
+    if (mapUploadBtn && mapStats) {
+        mapUploadBtn.style.display = track ? 'none' : 'flex';
+        mapStats.style.display = track ? 'flex' : 'none';
+    }
+    if (track) {
+        if (mapName) mapName.textContent = track.name;
+        if (mapDist) mapDist.textContent = `${track.distanceKm.toFixed(1)} km`;
+        if (mapElev) mapElev.textContent = `+${track.elevationGainM} m`;
+    }
+
+    const stEmpty = document.getElementById('studio-gpx-empty');
+    const stCtrls = document.getElementById('studio-gpx-controls');
+    const stBadge = document.getElementById('studio-gpx-badge');
+    const stName = document.getElementById('studio-gpx-name');
+    const stDist = document.getElementById('studio-gpx-dist');
+    const stElev = document.getElementById('studio-gpx-elev');
+    const stOob = document.getElementById('studio-gpx-out-of-bounds');
+
+    if (stEmpty && stCtrls) {
+        stEmpty.style.display = track ? 'none' : 'block';
+        stCtrls.style.display = track ? 'flex' : 'none';
+    }
+    if (stBadge) {
+        stBadge.textContent = track ? `${track.distanceKm.toFixed(1)} km` : 'Optionnel';
+    }
+    if (track) {
+        if (stName) stName.textContent = track.name;
+        if (stDist) stDist.textContent = `${track.distanceKm.toFixed(1)} km`;
+        if (stElev) stElev.textContent = `+${track.elevationGainM} m D+`;
+        if (stOob) {
+            const compiledBBox = appState.compiledData && appState.compiledData.bbox;
+            stOob.style.display = (compiledBBox && !doesGpxIntersectBBox(track, compiledBBox)) ? 'block' : 'none';
+        }
+    }
+
+    const tGpx = document.getElementById('studio-toggle-gpx');
+    const cGpx = document.getElementById('color-gpx');
+    const hGpx = document.getElementById('hex-gpx');
+    const sGpx = document.getElementById('input-stroke-gpx');
+    const lGpx = document.getElementById('label-stroke-gpx');
+    const tMarkers = document.getElementById('studio-toggle-gpx-markers');
+    const tHalo = document.getElementById('studio-toggle-gpx-halo');
+
+    if (tGpx) tGpx.checked = !!appState.showGpxTrack;
+    if (cGpx) cGpx.value = appState.gpxColor;
+    if (hGpx) hGpx.value = appState.gpxColor.toUpperCase();
+    if (sGpx) sGpx.value = appState.gpxWidth;
+    if (lGpx) lGpx.textContent = `${appState.gpxWidth}px`;
+    if (tMarkers) tMarkers.checked = !!appState.showGpxMarkers;
+    if (tHalo) tHalo.checked = !!appState.showGpxHalo;
+}
+
+function clearGpxTrack() {
+    appState.gpxTrack = null;
+    if (appState.gpxMapLayer && appState.map) {
+        appState.map.removeLayer(appState.gpxMapLayer);
+        appState.gpxMapLayer = null;
+    }
+    updateGpxUiPanels();
+    if (document.getElementById('view-studio').style.display !== 'none') {
+        renderStudioPreview();
+    }
+}
+
+async function handleGpxFile(file) {
+    if (!file) return;
+    if (!/\.gpx$/i.test(file.name) && file.type !== 'application/gpx+xml' && file.type !== 'text/xml') {
+        alert('Veuillez déposer un fichier .gpx (export Strava, Garmin, Komoot...).');
+        return;
+    }
+
+    try {
+        const xmlText = await file.text();
+        const parsed = parseGpxContent(xmlText, file.name);
+        appState.gpxTrack = parsed;
+        appState.showGpxTrack = true;
+
+        renderGpxOnLeafletMap();
+
+        const isStudioView = document.getElementById('view-studio').style.display !== 'none';
+        if (!isStudioView) {
+            fitMapToGpxTrack();
+            const upperName = parsed.name.toUpperCase();
+            appState.titleText = upperName;
+            const statsSub = `${parsed.distanceKm.toFixed(1)} KM · +${parsed.elevationGainM} M D+`;
+            appState.subtitleText = statsSub;
+            const inTitle = document.getElementById('input-title');
+            const inSub = document.getElementById('input-subtitle');
+            if (inTitle) inTitle.value = upperName;
+            if (inSub) inSub.value = statsSub;
+            updateLivePreview();
+        } else {
+            renderStudioPreview();
+        }
+
+        updateGpxUiPanels();
+    } catch (err) {
+        console.error('Erreur lecture GPX :', err);
+        alert(`Impossible de lire ce fichier GPX : ${err.message}`);
+    }
+}
+
+function drawGpxTrackOnCanvas(ctx, bbox, mapX, mapY, mapW, mapH, canvasW, format) {
+    const track = appState.gpxTrack;
+    if (!track || !bbox || !track.segments || track.segments.length === 0) return;
+
+    const previewBaseW = (format.ratio >= 1 ? 1800 : Math.round(1800 * format.ratio));
+    const scaleRatio = canvasW / previewBaseW;
+    const strokeW = Math.max(1.2, (appState.gpxWidth || 3.2) * scaleRatio);
+    const trackColor = appState.gpxColor || '#FC4C02';
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(mapX, mapY, mapW, mapH);
+    ctx.clip();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    const drawPaths = () => {
+        ctx.beginPath();
+        for (const seg of track.segments) {
+            if (!seg || seg.length < 2) continue;
+            const p0 = projectGpxPoint(seg[0].lat, seg[0].lon, bbox);
+            ctx.moveTo(mapX + p0.x * mapW, mapY + p0.y * mapH);
+            for (let i = 1; i < seg.length; i++) {
+                const pt = projectGpxPoint(seg[i].lat, seg[i].lon, bbox);
+                ctx.lineTo(mapX + pt.x * mapW, mapY + pt.y * mapH);
+            }
+        }
+    };
+
+    if (appState.showGpxHalo) {
+        drawPaths();
+        ctx.strokeStyle = isColorDark(trackColor) ? 'rgba(255, 255, 255, 0.78)' : 'rgba(10, 12, 16, 0.68)';
+        ctx.lineWidth = strokeW + 3.2 * scaleRatio;
+        ctx.stroke();
+    }
+
+    drawPaths();
+    ctx.strokeStyle = trackColor;
+    ctx.lineWidth = strokeW;
+    ctx.stroke();
+
+    if (appState.showGpxMarkers) {
+        const firstSeg = track.segments[0];
+        const lastSeg = track.segments[track.segments.length - 1];
+        const markerR = Math.max(4, strokeW * 1.65);
+
+        if (firstSeg && firstSeg.length > 0) {
+            const pStart = projectGpxPoint(firstSeg[0].lat, firstSeg[0].lon, bbox);
+            const sx = mapX + pStart.x * mapW;
+            const sy = mapY + pStart.y * mapH;
+            ctx.beginPath();
+            ctx.arc(sx, sy, markerR, 0, Math.PI * 2);
+            ctx.fillStyle = '#22c55e';
+            ctx.fill();
+            ctx.lineWidth = Math.max(1.5, strokeW * 0.6);
+            ctx.strokeStyle = '#ffffff';
+            ctx.stroke();
+        }
+        if (lastSeg && lastSeg.length > 0) {
+            const lastPt = lastSeg[lastSeg.length - 1];
+            const pEnd = projectGpxPoint(lastPt.lat, lastPt.lon, bbox);
+            const ex = mapX + pEnd.x * mapW;
+            const ey = mapY + pEnd.y * mapH;
+            ctx.beginPath();
+            ctx.arc(ex, ey, markerR, 0, Math.PI * 2);
+            ctx.fillStyle = trackColor;
+            ctx.fill();
+            ctx.lineWidth = Math.max(1.5, strokeW * 0.6);
+            ctx.strokeStyle = '#ffffff';
+            ctx.stroke();
+        }
+    }
+
+    ctx.restore();
+}
+
+function buildGpxSvgLayer(bbox, mapW, mapH, canvasW, format) {
+    const track = appState.gpxTrack;
+    if (!track || !bbox || !track.segments || track.segments.length === 0) return '';
+
+    const previewBaseW = (format.ratio >= 1 ? 1800 : Math.round(1800 * format.ratio));
+    const scaleRatio = canvasW / previewBaseW;
+    const strokeW = Math.max(1.2, (appState.gpxWidth || 3.2) * scaleRatio);
+    const trackColor = appState.gpxColor || '#FC4C02';
+
+    let dAll = '';
+    for (const seg of track.segments) {
+        if (!seg || seg.length < 2) continue;
+        for (let i = 0; i < seg.length; i++) {
+            const pt = projectGpxPoint(seg[i].lat, seg[i].lon, bbox);
+            const sx = (pt.x * mapW).toFixed(1);
+            const sy = (pt.y * mapH).toFixed(1);
+            dAll += (i === 0 ? `M ${sx} ${sy}` : ` L ${sx} ${sy}`);
+        }
+    }
+    if (!dAll) return '';
+
+    let svg = `    <g id="trace-gpx" fill="none" stroke-linecap="round" stroke-linejoin="round">\n`;
+    if (appState.showGpxHalo) {
+        const haloColor = isColorDark(trackColor) ? '#FFFFFF' : '#0A0C10';
+        const haloW = (strokeW + 3.2 * scaleRatio).toFixed(2);
+        svg += `      <path d="${dAll}" stroke="${haloColor}" stroke-opacity="0.72" stroke-width="${haloW}"/>\n`;
+    }
+    svg += `      <path d="${dAll}" stroke="${escapeXmlAttr(trackColor)}" stroke-width="${strokeW.toFixed(2)}"/>\n`;
+
+    if (appState.showGpxMarkers) {
+        const firstSeg = track.segments[0];
+        const lastSeg = track.segments[track.segments.length - 1];
+        const markerR = Math.max(4, strokeW * 1.65).toFixed(1);
+        const markerStroke = Math.max(1.5, strokeW * 0.6).toFixed(2);
+
+        if (firstSeg && firstSeg.length > 0) {
+            const pStart = projectGpxPoint(firstSeg[0].lat, firstSeg[0].lon, bbox);
+            svg += `      <circle cx="${(pStart.x * mapW).toFixed(1)}" cy="${(pStart.y * mapH).toFixed(1)}" r="${markerR}" fill="#22c55e" stroke="#ffffff" stroke-width="${markerStroke}"/>\n`;
+        }
+        if (lastSeg && lastSeg.length > 0) {
+            const lastPt = lastSeg[lastSeg.length - 1];
+            const pEnd = projectGpxPoint(lastPt.lat, lastPt.lon, bbox);
+            svg += `      <circle cx="${(pEnd.x * mapW).toFixed(1)}" cy="${(pEnd.y * mapH).toFixed(1)}" r="${markerR}" fill="${escapeXmlAttr(trackColor)}" stroke="#ffffff" stroke-width="${markerStroke}"/>\n`;
+        }
+    }
+
+    svg += `    </g>\n`;
+    return svg;
+}
+
+function setupGpxDropAndControls() {
+    const fileInput = document.getElementById('gpx-file-input');
+    const mapUploadBtn = document.getElementById('gpx-upload-btn');
+    const studioDropzone = document.getElementById('studio-gpx-dropzone');
+    const studioReplaceBtn = document.getElementById('studio-gpx-replace');
+    const globalOverlay = document.getElementById('gpx-global-drop-overlay');
+
+    const openPicker = () => {
+        if (fileInput) {
+            fileInput.value = '';
+            fileInput.click();
+        }
+    };
+
+    if (fileInput) {
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files && e.target.files[0]) {
+                handleGpxFile(e.target.files[0]);
+            }
+        });
+    }
+
+    [mapUploadBtn, studioDropzone, studioReplaceBtn].forEach(el => {
+        if (!el) return;
+        el.addEventListener('click', openPicker);
+    });
+
+    // Drag & Drop sur la fenêtre entière (Vue Carte + Vue Studio)
+    let dragCounter = 0;
+    window.addEventListener('dragenter', (e) => {
+        if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+        e.preventDefault();
+        dragCounter++;
+        if (globalOverlay) globalOverlay.classList.add('show');
+    });
+
+    window.addEventListener('dragover', (e) => {
+        if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+        e.preventDefault();
+    });
+
+    window.addEventListener('dragleave', () => {
+        dragCounter = Math.max(0, dragCounter - 1);
+        if (dragCounter === 0) {
+            if (globalOverlay) globalOverlay.classList.remove('show');
+        }
+    });
+
+    window.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dragCounter = 0;
+        if (globalOverlay) globalOverlay.classList.remove('show');
+        if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]) {
+            handleGpxFile(e.dataTransfer.files[0]);
+        }
+    });
+
+    const btnFit = document.getElementById('gpx-btn-fit');
+    if (btnFit) btnFit.addEventListener('click', fitMapToGpxTrack);
+
+    const btnClearMap = document.getElementById('gpx-btn-clear');
+    const btnClearStudio = document.getElementById('studio-gpx-clear');
+    if (btnClearMap) btnClearMap.addEventListener('click', clearGpxTrack);
+    if (btnClearStudio) btnClearStudio.addEventListener('click', clearGpxTrack);
+
+    // Contrôles Studio GPX
+    const tGpx = document.getElementById('studio-toggle-gpx');
+    if (tGpx) {
+        tGpx.addEventListener('change', (e) => {
+            appState.showGpxTrack = e.target.checked;
+            renderStudioPreview();
+        });
+    }
+
+    const tMarkers = document.getElementById('studio-toggle-gpx-markers');
+    if (tMarkers) {
+        tMarkers.addEventListener('change', (e) => {
+            appState.showGpxMarkers = e.target.checked;
+            renderStudioPreview();
+        });
+    }
+
+    const tHalo = document.getElementById('studio-toggle-gpx-halo');
+    if (tHalo) {
+        tHalo.addEventListener('change', (e) => {
+            appState.showGpxHalo = e.target.checked;
+            renderStudioPreview();
+        });
+    }
+
+    const cGpx = document.getElementById('color-gpx');
+    const hGpx = document.getElementById('hex-gpx');
+    const setGpxColor = (val) => {
+        appState.gpxColor = val;
+        if (cGpx) cGpx.value = val;
+        if (hGpx) hGpx.value = val.toUpperCase();
+        renderGpxOnLeafletMap();
+        renderStudioPreview();
+    };
+    if (cGpx && hGpx) {
+        cGpx.addEventListener('input', (e) => { hGpx.value = e.target.value.toUpperCase(); });
+        cGpx.addEventListener('change', (e) => setGpxColor(e.target.value));
+        hGpx.addEventListener('change', (e) => {
+            let v = e.target.value.trim();
+            if (!v.startsWith('#')) v = '#' + v;
+            if (/^#[0-9A-Fa-f]{6}$/.test(v)) setGpxColor(v);
+        });
+    }
+
+    document.querySelectorAll('[data-gpx-color]').forEach(dot => {
+        dot.addEventListener('click', () => setGpxColor(dot.dataset.gpxColor));
+    });
+
+    const sGpx = document.getElementById('input-stroke-gpx');
+    const lGpx = document.getElementById('label-stroke-gpx');
+    if (sGpx && lGpx) {
+        sGpx.addEventListener('input', (e) => {
+            const v = parseFloat(e.target.value);
+            appState.gpxWidth = v;
+            lGpx.textContent = `${v}px`;
+            renderStudioPreview();
+        });
+    }
+
+    const btnStatsSub = document.getElementById('studio-gpx-apply-stats');
+    if (btnStatsSub) {
+        btnStatsSub.addEventListener('click', () => {
+            if (!appState.gpxTrack) return;
+            const statsSub = `${appState.gpxTrack.distanceKm.toFixed(1)} KM · +${appState.gpxTrack.elevationGainM} M D+`;
+            appState.subtitleText = statsSub;
+            const stSub = document.getElementById('studio-input-subtitle');
+            const mpSub = document.getElementById('input-subtitle');
+            if (stSub) stSub.value = statsSub;
+            if (mpSub) mpSub.value = statsSub;
+            renderStudioPreview();
+        });
+    }
+}
